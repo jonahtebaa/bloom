@@ -1,8 +1,9 @@
 """SQLite-backed storage for Bloom turns and sessions.
 
 Schema is intentionally minimal — turns are the only first-class entity.
-Sessions are derived from `session_id` on turns; we keep a sessions table for
-metadata (started_at, ended_at, label) but it's optional.
+Sessions are tracked via a `sessions` table populated by `insert_turn`; we
+read from it (joined against `turns` for accurate counts) in `list_sessions`
+to scale better than a per-call `GROUP BY` on large `turns` tables.
 
 Migrations are handled via a single `schema_version` row in `bloom_meta`.
 Bumping `SCHEMA_VERSION` and adding a new branch in `_migrate` is the way
@@ -11,6 +12,7 @@ forward — never drop columns in place.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -18,28 +20,61 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# FTS5 special characters that require quoting when used in MATCH queries.
+_FTS5_SPECIAL = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _fts5_escape(token: str) -> str:
+    """Wrap a token in double quotes (escaping internal quotes) if it contains
+    FTS5-special characters; otherwise return as-is.
+    """
+    if not token:
+        return ""
+    if _FTS5_SPECIAL.search(token):
+        return '"' + token.replace('"', '""') + '"'
+    return token
 
 
 class Database:
-    """Thin wrapper around sqlite3 with Bloom-specific helpers."""
+    """Thin wrapper around sqlite3 with Bloom-specific helpers.
+
+    Holds a single long-lived connection on the instance so PRAGMAs apply
+    once and multiple calls don't pay reconnection cost.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._con = sqlite3.connect(
+            str(self.path), timeout=5.0, check_same_thread=False
+        )
+        self._con.row_factory = sqlite3.Row
+        self._con.execute("PRAGMA journal_mode=WAL")
+        self._con.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        con = sqlite3.connect(self.path, timeout=5.0)
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA synchronous=NORMAL")
+        """Yield the cached connection. Kept for backwards compatibility —
+        the connection lifecycle is now owned by the Database instance.
+        """
         try:
-            yield con
-            con.commit()
-        finally:
-            con.close()
+            yield self._con
+            self._con.commit()
+        except Exception:
+            self._con.rollback()
+            raise
+
+    def close(self) -> None:
+        try:
+            self._con.close()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        self.close()
 
     def _init_schema(self) -> None:
         with self.connect() as con:
@@ -88,9 +123,37 @@ class Database:
                 );
                 """
             )
+        if from_version < 2:
+            # FTS5 virtual table mirroring `turns.content` + triggers + backfill.
+            con.executescript(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+                    content,
+                    content='turns',
+                    content_rowid='id'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
+                    INSERT INTO turns_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
+                    INSERT INTO turns_fts(turns_fts, rowid, content) VALUES('delete', old.id, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
+                    INSERT INTO turns_fts(turns_fts, rowid, content) VALUES('delete', old.id, old.content);
+                    INSERT INTO turns_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+                """
+            )
+            # Backfill any pre-existing rows.
+            con.execute(
+                "INSERT INTO turns_fts(rowid, content) "
+                "SELECT id, content FROM turns "
+                "WHERE id NOT IN (SELECT rowid FROM turns_fts)"
+            )
         con.execute(
             "INSERT OR REPLACE INTO bloom_meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
+            (int(SCHEMA_VERSION),),
         )
 
     def insert_turn(
@@ -123,53 +186,71 @@ class Database:
             return int(cur.lastrowid)
 
     def fetch_recent(self, session_id: str, n: int = 20) -> list[sqlite3.Row]:
+        """Return the most recent N turns for a session, sorted chronologically."""
         with self.connect() as con:
             return list(
                 con.execute(
                     """
-                    SELECT id, session_id, role, content, tags, ts
-                    FROM turns
-                    WHERE session_id = ?
-                    ORDER BY ts ASC
-                    LIMIT ?
+                    SELECT * FROM (
+                        SELECT id, session_id, role, content, tags, ts
+                        FROM turns
+                        WHERE session_id = ?
+                        ORDER BY ts DESC, id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY ts ASC, id ASC
                     """,
                     (session_id, n),
                 ).fetchall()
             )
 
-    def search_like(self, keywords: list[str], limit: int) -> list[sqlite3.Row]:
+    def search_content(self, keywords: list[str], limit: int) -> list[sqlite3.Row]:
+        """Full-text search over `turns.content` via FTS5, ordered by bm25."""
         if not keywords:
             return []
-        clause = " OR ".join(["content LIKE ?"] * len(keywords))
-        params: list[Any] = [f"%{k}%" for k in keywords]
-        params.append(limit)
+        # Build MATCH query: keywords OR'd, FTS5-special chars wrapped in quotes.
+        terms = [_fts5_escape(k) for k in keywords if k]
+        terms = [t for t in terms if t]
+        if not terms:
+            return []
+        match_query = " OR ".join(terms)
         with self.connect() as con:
-            return list(
-                con.execute(
-                    f"""
-                    SELECT id, session_id, role, content, tags, ts
-                    FROM turns
-                    WHERE {clause}
-                    ORDER BY ts DESC
-                    LIMIT ?
-                    """,
-                    params,
-                ).fetchall()
-            )
+            try:
+                return list(
+                    con.execute(
+                        """
+                        SELECT t.id, t.session_id, t.role, t.content, t.tags, t.ts
+                        FROM turns_fts f
+                        JOIN turns t ON t.id = f.rowid
+                        WHERE turns_fts MATCH ?
+                        ORDER BY bm25(turns_fts)
+                        LIMIT ?
+                        """,
+                        (match_query, limit),
+                    ).fetchall()
+                )
+            except sqlite3.OperationalError:
+                # Malformed query or empty FTS table — return cleanly.
+                return []
+
+    def search_like(self, keywords: list[str], limit: int) -> list[sqlite3.Row]:
+        """Deprecated alias — delegates to `search_content`."""
+        return self.search_content(keywords, limit)
 
     def list_sessions(self, limit: int = 50) -> list[sqlite3.Row]:
+        # Read from `sessions` table joined with COUNT(*) over turns for accurate counts.
         with self.connect() as con:
             return list(
                 con.execute(
                     """
                     SELECT
-                      session_id AS id,
-                      MIN(ts)    AS started_at,
-                      MAX(ts)    AS last_ts,
-                      COUNT(*)   AS turn_count
-                    FROM turns
-                    WHERE session_id IS NOT NULL
-                    GROUP BY session_id
+                      s.id        AS id,
+                      s.started_at AS started_at,
+                      COALESCE(MAX(t.ts), s.started_at) AS last_ts,
+                      COUNT(t.id) AS turn_count
+                    FROM sessions s
+                    LEFT JOIN turns t ON t.session_id = s.id
+                    GROUP BY s.id
                     ORDER BY last_ts DESC
                     LIMIT ?
                     """,
