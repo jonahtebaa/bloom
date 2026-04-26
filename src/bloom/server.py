@@ -67,7 +67,7 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                 "type": "object",
                 "properties": {
                     "content": {"type": "string", "description": "Text to remember"},
-                    "session": {"type": "string", "description": "Session id"},
+                    "session_id": {"type": "string", "description": "Session id"},
                     "tags": {"type": "string", "description": "Comma-separated tags"},
                     "role": {
                         "type": "string",

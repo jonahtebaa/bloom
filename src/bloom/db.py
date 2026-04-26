@@ -393,29 +393,105 @@ class Database:
     ) -> list[sqlite3.Row]:
         """Return the most recent N live rows that have an embedding stored.
 
-        Used by recall's semantic candidate path so cosine similarity can
-        surface keyword-miss matches (e.g. "queue choice" finds "we picked
-        postgres for the lock primitive"). Ordered by `ts DESC, id DESC`.
+        Thin wrapper around `fetch_embedding_pool(recent_share=1.0, ...)` —
+        kept for backwards-compatibility with tests/callers built before
+        stratified sampling. Ordered by `ts DESC, id DESC`.
 
         `only_session` (optional): hard-filter to a single session_id.
         `exclude_session` (optional): drop rows from a particular session.
         """
-        sql = (
-            "SELECT id, session_id, role, content, tags, ts, embedding "
-            "FROM turns "
-            "WHERE deleted_at IS NULL AND embedding IS NOT NULL"
+        return self.fetch_embedding_pool(
+            limit=limit,
+            recent_share=1.0,
+            exclude_session=exclude_session,
+            only_session=only_session,
         )
-        params: list[Any] = []
+
+    def fetch_embedding_pool(
+        self,
+        limit: int = 200,
+        recent_share: float = 0.6,
+        exclude_session: str | None = None,
+        only_session: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Stratified pool of live rows with embeddings: recent + sampled-older.
+
+        Returns up to `limit` rows. The first `int(limit * recent_share)` are
+        the most-recent embedded rows by `ts DESC`. The remainder are sampled
+        uniformly at random from older embedded rows (`ts` strictly less than
+        the cutoff used for the recent slice).
+
+        This replaces "200 most recent" with a tradeoff: on a 10K-turn DB,
+        an old keyword-miss row can still surface via cosine similarity.
+
+        `only_session` (optional): hard-filter to a single session_id.
+        `exclude_session` (optional): drop rows from a particular session.
+        """
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
+        recent_share = max(0.0, min(1.0, float(recent_share)))
+        recent_n = int(limit * recent_share)
+        older_n = limit - recent_n
+
+        cols = "id, session_id, role, content, tags, ts, embedding"
+        where = "deleted_at IS NULL AND embedding IS NOT NULL"
+        scope_sql = ""
+        scope_params: list[Any] = []
         if only_session is not None:
-            sql += " AND session_id = ?"
-            params.append(only_session)
+            scope_sql += " AND session_id = ?"
+            scope_params.append(only_session)
         if exclude_session is not None:
-            sql += " AND (session_id IS NULL OR session_id != ?)"
-            params.append(exclude_session)
-        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
-        params.append(int(limit))
+            scope_sql += " AND (session_id IS NULL OR session_id != ?)"
+            scope_params.append(exclude_session)
+
         with self.connect() as con:
-            return list(con.execute(sql, params).fetchall())
+            recent_rows: list[sqlite3.Row] = []
+            cutoff_ts: int | None = None
+            cutoff_id: int | None = None
+            if recent_n > 0:
+                recent_rows = list(
+                    con.execute(
+                        f"SELECT {cols} FROM turns WHERE {where}{scope_sql} "
+                        f"ORDER BY ts DESC, id DESC LIMIT ?",
+                        [*scope_params, recent_n],
+                    ).fetchall()
+                )
+                if recent_rows:
+                    last = recent_rows[-1]
+                    cutoff_ts = int(last["ts"] or 0)
+                    cutoff_id = int(last["id"])
+
+            older_rows: list[sqlite3.Row] = []
+            if older_n > 0:
+                # "Older than the recent cutoff" = strictly earlier ts, OR
+                # same ts but lower id — mirrors the (ts DESC, id DESC) sort.
+                if cutoff_ts is None:
+                    # No recent slice taken — sample over the whole pool.
+                    older_rows = list(
+                        con.execute(
+                            f"SELECT {cols} FROM turns WHERE {where}{scope_sql} "
+                            f"ORDER BY RANDOM() LIMIT ?",
+                            [*scope_params, older_n],
+                        ).fetchall()
+                    )
+                else:
+                    older_rows = list(
+                        con.execute(
+                            f"SELECT {cols} FROM turns WHERE {where}{scope_sql} "
+                            f"AND (ts < ? OR (ts = ? AND id < ?)) "
+                            f"ORDER BY RANDOM() LIMIT ?",
+                            [
+                                *scope_params,
+                                cutoff_ts,
+                                cutoff_ts,
+                                cutoff_id,
+                                older_n,
+                            ],
+                        ).fetchall()
+                    )
+
+        return [*recent_rows, *older_rows]
 
     def list_sessions(self, limit: int = 50) -> list[sqlite3.Row]:
         # Read from `sessions` table joined with COUNT(*) over turns for accurate counts.
@@ -486,6 +562,11 @@ class Database:
             ).fetchone()
             db_size = self.path.stat().st_size if self.path.exists() else 0
         return {
+            # Canonical keys (descriptive).
+            "total_turns": int(turns),
+            "total_sessions": int(sessions),
+            # Legacy aliases — kept for backward compatibility with callers
+            # that grew up against the original key names.
             "turns": int(turns),
             "sessions": int(sessions),
             "oldest_ts": oldest_row["t"],

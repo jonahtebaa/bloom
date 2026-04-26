@@ -220,23 +220,35 @@ def _score_with_embedder(
     embedder_dim: int,
     session_id: str | None,
     now: int,
+    bm25_norm_by_id: dict[int, float] | None = None,
 ) -> list[ScoredTurn]:
     """Hybrid score: 0.4*bm25_norm + 0.5*cosine + 0.1*recency_norm.
 
-    bm25 isn't directly exposed by sqlite3's FTS5 binding through our query,
-    but the FTS rowset arrives in bm25-rank order. We approximate the
-    normalized bm25 contribution by using the row's *position* in the
-    candidate list (best=1.0, worst=0.0). Same for recency.
+    `bm25_norm_by_id` (optional) maps row id -> normalized bm25 contribution
+    derived from the row's actual FTS5 rank (best = 1.0, worst tail of the
+    keyword pool -> 0.0). Pure-semantic rows (no keyword overlap, surfaced
+    only via the cosine pool) are NOT in this map and get bm25_norm = 0.0,
+    so the keyword channel can never spoof a score for them.
+
+    If `bm25_norm_by_id` is None we fall back to a position-based proxy
+    over `rows` — the legacy keyword-only behavior, harmless when the caller
+    isn't doing a unioned pool.
     """
     import numpy as np
 
     if not rows:
         return []
     n = len(rows)
-    # Position-based bm25 proxy: top of candidate list = 1.0, bottom = 0.0.
-    # FTS5 already sorted by bm25 ascending (smaller is better in bm25), so
-    # the first row is the strongest match.
-    bm25_norm = [1.0 - (i / max(1, n - 1)) for i in range(n)] if n > 1 else [1.0]
+    if bm25_norm_by_id is None:
+        # Legacy path: position-based bm25 proxy over a homogeneous candidate
+        # list. Used by callers that haven't yet split FTS vs semantic.
+        bm25_norm = (
+            [1.0 - (i / max(1, n - 1)) for i in range(n)] if n > 1 else [1.0]
+        )
+    else:
+        # Real-rank path: lookups from the FTS pool, 0.0 for pure-semantic
+        # rows so cosine alone has to carry them.
+        bm25_norm = [bm25_norm_by_id.get(int(r["id"]), 0.0) for r in rows]
 
     # Recency normalization across this candidate set only.
     ages = [max(0.0, (now - int(r["ts"] or now)) / 86400.0) for r in rows]
@@ -313,10 +325,11 @@ def recall(
     down into the SQL so the LIMIT applies AFTER the session filter).
     `embedder` (optional): if provided and `embedder.dim > 0`, augments scoring
     with cosine similarity. The candidate pool is the union of (a) the FTS5
-    keyword candidates and (b) up to `semantic_pool_size` recent rows that
-    have an embedding stored — so semantic-only matches (no shared keyword
-    with the query) still surface. This is O(N) per query where N is bounded
-    by `semantic_pool_size`; a future ANN index would lift the bound.
+    keyword candidates and (b) up to `semantic_pool_size` rows with embeddings
+    drawn from a stratified pool (60% recent, 40% sampled older) — so
+    semantic-only matches (no shared keyword with the query) still surface,
+    even on large DBs where an old keyword-miss row would otherwise never
+    enter the cosine pool. For very large DBs, switch to ANN.
     """
     keywords = extract_keywords(query)
 
@@ -351,11 +364,11 @@ def recall(
             return []
         return score_turns(candidates, keywords, session_id=session_id)[:k]
 
-    # Semantic candidate pool: most-recent rows with stored embeddings.
-    # We compute cosine for each and take the top M so a query with NO
-    # shared keyword can still find a row by meaning alone.
-    semantic_pool = db.fetch_recent_with_embeddings(
+    # Stratified pool (60% recent, 40% sampled older). For very large DBs,
+    # switch to ANN.
+    semantic_pool = db.fetch_embedding_pool(
         limit=int(semantic_pool_size),
+        recent_share=0.6,
         only_session=filter_session,
     )
     semantic_top = _semantic_topk(
@@ -364,6 +377,19 @@ def recall(
         embedder_dim=int(getattr(embedder, "dim", 0)),
         top_m=max(k * 5, 50),
     )
+
+    # Per-row BM25 contribution. FTS rows get their real rank-derived value
+    # (best in pool = 1.0, worst tail = 0.0). Pure-semantic rows are NOT in
+    # this map — they get 0.0 inside _score_with_embedder, so cosine alone
+    # has to carry them. This is the fix for the bm25-spoofing bug where
+    # semantic-only rows inherited a high bm25 proxy from list position.
+    fts_n = len(candidates)
+    bm25_norm_by_id: dict[int, float] = {}
+    for i, r in enumerate(candidates):
+        if fts_n > 1:
+            bm25_norm_by_id[int(r["id"])] = 1.0 - (i / max(1, fts_n - 1))
+        else:
+            bm25_norm_by_id[int(r["id"])] = 1.0
 
     # Union the two pools, dedup by id, and run hybrid scoring on the union.
     seen_ids: set[int] = set()
@@ -394,6 +420,7 @@ def recall(
         embedder_dim=int(getattr(embedder, "dim", 0)),
         session_id=session_id,
         now=now,
+        bm25_norm_by_id=bm25_norm_by_id,
     )
     return scored[:k]
 

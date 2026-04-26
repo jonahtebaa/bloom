@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- numpy is now a declared runtime dependency (was implicit).
+- Hybrid recall no longer spoofs BM25 scores for pure-semantic candidates
+  (rows that match by cosine but share no keyword with the query). The
+  BM25 contribution now reflects the true FTS5 rank for keyword candidates
+  and is `0.0` for pure-semantic candidates.
+- `tool_stats` now exposes both the legacy `turns`/`sessions` keys and the
+  more descriptive `total_turns`/`total_sessions` aliases so callers built
+  against either name work.
+- `tool_remember` parameter renamed `session` -> `session_id` to align with
+  the MCP server's tool schema.
+- Semantic recall pool now uses a stratified sample (recent + older random)
+  instead of just the 200 most-recent embedded turns, so old keyword-miss
+  turns can still surface via cosine similarity on large DBs.
+
 ### Added
 - **Embedders are now active.** When `embedder` is set to `openai`,
   `anthropic` (Voyage AI), or `local` in `~/.bloom/config.toml`, `remember`

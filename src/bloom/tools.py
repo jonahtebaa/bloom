@@ -131,7 +131,7 @@ def tool_remember(
     db: Database,
     cfg: Config,  # noqa: ARG001
     content: str,
-    session: str | None = None,
+    session_id: str | None = None,
     tags: str | None = None,
     role: str | None = _DEFAULT_ROLE,
     embedder: Any | None = None,
@@ -158,7 +158,7 @@ def tool_remember(
     embedding_bytes = _embed_doc_safely(embedder, stripped)
     turn_id = db.insert_turn(
         content=stripped,
-        session_id=session,
+        session_id=session_id,
         role=effective_role,
         tags=tags,
         embedding=embedding_bytes,

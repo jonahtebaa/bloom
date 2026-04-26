@@ -23,9 +23,9 @@ def setup(tmp_path: Path) -> tuple[Database, Config]:
 
 def test_recall_k_zero_clamps_to_one(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    tool_remember(db, cfg, content="alpha beta gamma", session="s1")
-    tool_remember(db, cfg, content="alpha matters here", session="s1")
-    tool_remember(db, cfg, content="alpha appears again", session="s1")
+    tool_remember(db, cfg, content="alpha beta gamma", session_id="s1")
+    tool_remember(db, cfg, content="alpha matters here", session_id="s1")
+    tool_remember(db, cfg, content="alpha appears again", session_id="s1")
     out = tool_recall(db, cfg, query="alpha", k=0)
     assert out["ok"] is True
     # k=0 clamps to 1, so at most 1 result returned (may be 0 if no match,
@@ -36,7 +36,7 @@ def test_recall_k_zero_clamps_to_one(setup: tuple[Database, Config]) -> None:
 def test_recall_k_negative_clamps_to_one(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
     for i in range(3):
-        tool_remember(db, cfg, content=f"alpha number {i}", session="s1")
+        tool_remember(db, cfg, content=f"alpha number {i}", session_id="s1")
     out = tool_recall(db, cfg, query="alpha", k=-1)
     assert out["ok"] is True
     assert out["count"] == 1
@@ -45,7 +45,7 @@ def test_recall_k_negative_clamps_to_one(setup: tuple[Database, Config]) -> None
 def test_recall_k_huge_clamps_to_fifty(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
     for i in range(80):
-        tool_remember(db, cfg, content=f"alpha row {i}", session="s1")
+        tool_remember(db, cfg, content=f"alpha row {i}", session_id="s1")
     out = tool_recall(db, cfg, query="alpha", k=999)
     assert out["ok"] is True
     assert out["count"] <= 50
@@ -63,9 +63,9 @@ def test_recall_empty_db_returns_empty(setup: tuple[Database, Config]) -> None:
 def test_recall_filter_session_restricts_results(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
     # s2 has stronger keyword density on purpose.
-    tool_remember(db, cfg, content="postgres only mention", session="s1")
+    tool_remember(db, cfg, content="postgres only mention", session_id="s1")
     for _ in range(5):
-        tool_remember(db, cfg, content="postgres postgres postgres queue lock", session="s2")
+        tool_remember(db, cfg, content="postgres postgres postgres queue lock", session_id="s2")
     out = tool_recall(db, cfg, query="postgres queue", filter_session="s1")
     assert out["ok"] is True
     assert out["count"] >= 1
@@ -87,10 +87,10 @@ def test_recall_filter_session_pushes_through_limit(setup: tuple[Database, Confi
             db,
             cfg,
             content=f"postgres postgres postgres queue lock row {i}",
-            session="s2",
+            session_id="s2",
         )
     # Single weak-match row in s1.
-    tool_remember(db, cfg, content="postgres mention here", session="s1")
+    tool_remember(db, cfg, content="postgres mention here", session_id="s1")
 
     out = tool_recall(db, cfg, query="postgres queue", filter_session="s1", k=5)
     assert out["ok"] is True
@@ -102,9 +102,9 @@ def test_recall_filter_session_pushes_through_limit(setup: tuple[Database, Confi
 
 def test_recall_session_bias_boosts_but_does_not_filter(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    tool_remember(db, cfg, content="postgres only mention", session="s1")
+    tool_remember(db, cfg, content="postgres only mention", session_id="s1")
     for _ in range(3):
-        tool_remember(db, cfg, content="postgres postgres queue lock", session="s2")
+        tool_remember(db, cfg, content="postgres postgres queue lock", session_id="s2")
     out = tool_recall(db, cfg, query="postgres queue", session_bias="s1", k=10)
     assert out["ok"] is True
     sessions_seen = {r["session_id"] for r in out["results"]}
@@ -120,7 +120,7 @@ def test_recall_session_bias_boosts_but_does_not_filter(setup: tuple[Database, C
 
 def test_recall_unicode_round_trip(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    tool_remember(db, cfg, content="北京 city note", session="s1")
+    tool_remember(db, cfg, content="北京 city note", session_id="s1")
     out = tool_recall(db, cfg, query="北京")
     assert out["ok"] is True
     assert out["count"] >= 1
@@ -152,7 +152,7 @@ def test_remember_oversize_rejected(setup: tuple[Database, Config]) -> None:
 
 def test_remember_role_none_defaults_to_note(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    out = tool_remember(db, cfg, content="explicit none role", session="s1", role=None)
+    out = tool_remember(db, cfg, content="explicit none role", session_id="s1", role=None)
     assert out["ok"] is True
     row = db.fetch_by_id(out["id"])
     assert row is not None
@@ -161,7 +161,7 @@ def test_remember_role_none_defaults_to_note(setup: tuple[Database, Config]) -> 
 
 def test_remember_returns_stored_ts(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    out = tool_remember(db, cfg, content="hello", session="s1")
+    out = tool_remember(db, cfg, content="hello", session_id="s1")
     assert out["ok"] is True
     row = db.fetch_by_id(out["id"])
     assert row is not None
@@ -200,7 +200,7 @@ def test_forget_missing_id_returns_not_found(setup: tuple[Database, Config]) -> 
 
 def test_forget_soft_deletes_and_recall_excludes(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    written = tool_remember(db, cfg, content="forgettable postgres queue note", session="s1")
+    written = tool_remember(db, cfg, content="forgettable postgres queue note", session_id="s1")
     tid = written["id"]
 
     # Sanity: recall finds it.
@@ -229,7 +229,7 @@ def test_forget_soft_deletes_and_recall_excludes(setup: tuple[Database, Config])
 def test_recent_n_negative_clamps_to_one(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
     for i in range(5):
-        tool_remember(db, cfg, content=f"row {i}", session="s1")
+        tool_remember(db, cfg, content=f"row {i}", session_id="s1")
     out = tool_recent(db, cfg, session_id="s1", n=-5)
     assert out["ok"] is True
     assert out["count"] == 1
@@ -238,7 +238,7 @@ def test_recent_n_negative_clamps_to_one(setup: tuple[Database, Config]) -> None
 def test_recent_n_huge_clamps_to_two_hundred(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
     for i in range(250):
-        tool_remember(db, cfg, content=f"row {i}", session="s1")
+        tool_remember(db, cfg, content=f"row {i}", session_id="s1")
     out = tool_recent(db, cfg, session_id="s1", n=99_999)
     assert out["ok"] is True
     assert out["count"] == 200
@@ -249,7 +249,7 @@ def test_recent_n_huge_clamps_to_two_hundred(setup: tuple[Database, Config]) -> 
 
 def test_recent_n_none_uses_default(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    tool_remember(db, cfg, content="only row", session="s1")
+    tool_remember(db, cfg, content="only row", session_id="s1")
     out = tool_recent(db, cfg, session_id="s1")
     assert out["ok"] is True
     assert out["count"] == 1

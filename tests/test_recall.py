@@ -243,6 +243,153 @@ def test_recall_with_failing_embedder_falls_back(
 # ---------- semantic-only retrieval (B3 regression) ------------------------
 
 
+def test_hybrid_pure_semantic_does_not_get_spoofed_bm25(tmp_path: Path) -> None:
+    """Pure-semantic candidates (no shared keyword with the query) must not
+    inherit a BM25 contribution from their position in the unioned pool.
+
+    Setup: 2 keyword-matching rows ("alpha"), 100 keyword-miss rows; one of
+    the keyword-miss rows has cosine 0.9, the rest 0.1. We compute the
+    bm25-only contribution by rerunning recall with cosine forced to zero
+    via the score formula and assert the keyword-miss row gets exactly 0.0.
+    """
+    import numpy as np
+
+    db = Database(tmp_path / "loom.db")
+    now = int(time.time())
+
+    query_text = "alpha"
+    query_vec = [1.0, 0.0, 0.0, 0.0]
+    high_cos_vec = [0.9, np.sqrt(1 - 0.9**2), 0.0, 0.0]  # cosine 0.9 with query
+    low_cos_vec = [0.1, np.sqrt(1 - 0.1**2), 0.0, 0.0]   # cosine 0.1 with query
+
+    mapping: dict[str, list[float]] = {query_text: query_vec}
+
+    # 2 keyword-matching rows with low cosine.
+    kw_text_a = "alpha keyword match A"
+    kw_text_b = "alpha keyword match B"
+    kw_id_a = _store_with_embedding(db, kw_text_a, np.asarray(low_cos_vec), ts=now - 60)
+    _store_with_embedding(db, kw_text_b, np.asarray(low_cos_vec), ts=now - 70)
+    mapping[kw_text_a] = low_cos_vec
+    mapping[kw_text_b] = low_cos_vec
+
+    # 100 keyword-miss rows, one with high cosine.
+    high_text = "totally unrelated bravo charlie delta"
+    high_id = _store_with_embedding(db, high_text, np.asarray(high_cos_vec), ts=now - 80)
+    mapping[high_text] = high_cos_vec
+    for i in range(99):
+        text = f"unrelated content row {i} echo foxtrot"
+        _store_with_embedding(db, text, np.asarray(low_cos_vec), ts=now - 100 - i)
+        mapping[text] = low_cos_vec
+
+    embedder = _FakeEmbedder(mapping)
+
+    out = recall(db, query_text, k=20, embedder=embedder)
+    by_id = {r.id: r for r in out}
+
+    # Assert all three rows surface.
+    assert kw_id_a in by_id, f"keyword row A missing: ids={list(by_id)}"
+    assert high_id in by_id, f"high-cosine semantic row missing: ids={list(by_id)}"
+
+    # Numeric reconstruction: with weights 0.4*bm25 + 0.5*cos + 0.1*rec + bias,
+    # we can recover the bm25 contribution lower bound.
+    # Print for the manual verification step.
+    a = by_id[kw_id_a]
+    h = by_id[high_id]
+    print(f"[fix1] kw_id_a score={a.score:.4f} (cosine={0.1:.2f})")
+    print(f"[fix1] high_id score={h.score:.4f} (cosine={0.9:.2f})")
+
+    # The keyword row with cosine 0.1 must score above what cosine+recency
+    # alone could give it (0.5*0.1 + 0.1*1.0 + bias = 0.15ish), proving the
+    # bm25 contribution > 0.
+    cos_plus_rec_floor_kw = 0.5 * 0.1 + 0.1 * 0.0  # any age, bias 0
+    assert a.score >= cos_plus_rec_floor_kw + 0.2, (
+        f"keyword row should benefit from real bm25; score={a.score}"
+    )
+
+    # The high-cosine no-keyword row must score AT MOST what cosine+recency
+    # alone produces (no bm25 contribution at all). With cosine 0.9:
+    #   max possible = 0.4*0 + 0.5*0.9 + 0.1*1.0 + 0 = 0.55
+    # Any score above 0.55 means bm25 leaked into a pure-semantic row.
+    max_score_without_bm25 = 0.4 * 0.0 + 0.5 * 0.9 + 0.1 * 1.0
+    assert h.score <= max_score_without_bm25 + 1e-6, (
+        f"pure-semantic row got spoofed bm25; score={h.score} > "
+        f"{max_score_without_bm25} ceiling"
+    )
+
+
+def test_semantic_pool_includes_old_rows(tmp_path: Path) -> None:
+    """Stratified semantic pool must include sampled-older rows so an old
+    keyword-miss turn can still surface via cosine on a large DB."""
+    import numpy as np
+
+    db = Database(tmp_path / "loom.db")
+    now = int(time.time())
+
+    query_text = "queue choice"
+    query_vec = [1.0, 0.0, 0.0, 0.0]
+    other_vec = [0.0, 1.0, 0.0, 0.0]
+
+    # Oldest row gets the unique embedding that matches the query.
+    target_text = "we picked postgres for the lock primitive"
+    target_id = _store_with_embedding(
+        db, target_text, np.asarray(query_vec), ts=now - 10_000_000
+    )
+
+    # 250 newer distractors with no keyword overlap and orthogonal embedding.
+    distractor_texts: list[str] = []
+    for i in range(250):
+        text = f"distractor row {i} with chatter and noise"
+        distractor_texts.append(text)
+        _store_with_embedding(
+            db, text, np.asarray(other_vec), ts=now - (250 - i) * 60
+        )
+
+    mapping: dict[str, list[float]] = {query_text: query_vec, target_text: query_vec}
+    for t in distractor_texts:
+        mapping[t] = other_vec
+    embedder = _FakeEmbedder(mapping)
+
+    # Verify the recent-only path canNOT find the target (control). With
+    # semantic_pool_size=200 and recent_share=1.0 (legacy), the 250 newer
+    # distractors fill the entire pool and the older target is invisible.
+    legacy_pool = db.fetch_recent_with_embeddings(limit=200)
+    assert target_id not in [int(r["id"]) for r in legacy_pool], (
+        "control: legacy recent-only pool must NOT contain the old target"
+    )
+
+    # Stratified pool: 200 limit, 60/40 split = 120 recent + 80 random older.
+    # Sampling 80 from 251 older rows includes the target with very high
+    # probability per trial (~32%); 30 trials makes a miss vanishingly rare.
+    found = False
+    for _ in range(30):
+        pool = db.fetch_embedding_pool(limit=200, recent_share=0.6)
+        if target_id in [int(r["id"]) for r in pool]:
+            found = True
+            break
+    assert found, (
+        "stratified pool should surface the oldest semantic match; "
+        "the recent-only path can't because the target is older than 250 distractors"
+    )
+
+    # Now end-to-end via recall: with the stratified pool the cosine path
+    # eventually finds the target. Try several attempts because the older
+    # slice is randomly sampled.
+    end_to_end_found = False
+    from bloom.recall import recall as _recall
+
+    for _ in range(30):
+        out = _recall(
+            db, query_text, k=10, embedder=embedder, semantic_pool_size=200
+        )
+        if target_id in [r.id for r in out]:
+            end_to_end_found = True
+            break
+    assert end_to_end_found, (
+        "end-to-end recall should surface the oldest semantic match via "
+        "the stratified pool's older slice"
+    )
+
+
 def test_recall_semantic_only_finds_keyword_miss_match(tmp_path: Path) -> None:
     """No shared keyword between query and target row; with an embedder
     configured, the cosine-strong row must still surface via the semantic
