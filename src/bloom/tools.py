@@ -7,12 +7,19 @@ besides the Database/Config passed in.
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from bloom.config import Config
 from bloom.db import Database
 from bloom.recall import ScoredTurn, recall
+
+# Hard limits — enforced at the API layer so a misconfigured client can't
+# blow up the DB or stuff arbitrary blobs into memory.
+_MAX_CONTENT_BYTES = 256 * 1024  # 256 KB
+_MAX_K = 50
+_MAX_RECENT = 200
+_MAX_SESSIONS = 100
+_DEFAULT_ROLE = "note"
 
 
 def _format_snippet(content: str, limit: int) -> str:
@@ -48,12 +55,28 @@ def tool_recall(
     cfg: Config,
     query: str,
     k: int | None = None,
-    session_filter: str | None = None,
+    session_bias: str | None = None,
+    filter_session: str | None = None,
 ) -> dict[str, Any]:
-    """Search past turns by query — keyword + recency scored, top-k returned."""
-    k = k or cfg.retrieve_top_k
-    results = recall(db, query, k=k, session_id=session_filter)
+    """Search past turns by query — keyword + recency scored, top-k returned.
+
+    `session_bias` (optional): boost results from that session.
+    `filter_session` (optional): restrict results to that session only.
+    """
+    if k is None:
+        k = cfg.retrieve_top_k
+    try:
+        k = int(k)
+    except (TypeError, ValueError):
+        k = cfg.retrieve_top_k
+    k = max(1, min(k, _MAX_K))
+
+    bias = session_bias if session_bias else None
+    flt = filter_session if filter_session else None
+
+    results = recall(db, query, k=k, session_id=bias, filter_session=flt)
     return {
+        "ok": True,
         "count": len(results),
         "results": [_scored_to_dict(s, cfg.snippet_max_chars) for s in results],
     }
@@ -65,29 +88,47 @@ def tool_remember(
     content: str,
     session: str | None = None,
     tags: str | None = None,
-    role: str | None = "note",
+    role: str | None = _DEFAULT_ROLE,
 ) -> dict[str, Any]:
     """Persist a single turn so future `recall` calls can surface it."""
-    if not content or not content.strip():
+    if not isinstance(content, str) or not content.strip():
         return {"ok": False, "error": "content is empty"}
+    encoded_len = len(content.encode("utf-8"))
+    if encoded_len > _MAX_CONTENT_BYTES:
+        return {
+            "ok": False,
+            "error": f"content too large (max {_MAX_CONTENT_BYTES} bytes)",
+        }
+    # Honor explicit role=None by falling back to default.
+    effective_role = role if role else _DEFAULT_ROLE
     turn_id = db.insert_turn(
         content=content.strip(),
         session_id=session,
-        role=role,
+        role=effective_role,
         tags=tags,
     )
-    return {"ok": True, "id": turn_id, "ts": int(time.time())}
+    row = db.fetch_by_id(turn_id)
+    ts = int(row["ts"]) if row else 0
+    return {"ok": True, "id": turn_id, "ts": ts}
 
 
 def tool_recent(
     db: Database,
     cfg: Config,
     session_id: str,
-    n: int = 20,
+    n: int | None = None,
 ) -> dict[str, Any]:
     """Return the last N turns from a specific session, in chronological order."""
+    if n is None:
+        n = cfg.retrieve_top_k
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = cfg.retrieve_top_k
+    n = max(1, min(n, _MAX_RECENT))
     rows = db.fetch_recent(session_id, n=n)
     return {
+        "ok": True,
         "session_id": session_id,
         "count": len(rows),
         "results": [
@@ -97,9 +138,17 @@ def tool_recent(
     }
 
 
-def tool_sessions(db: Database, cfg: Config, limit: int = 50) -> dict[str, Any]:  # noqa: ARG001
+def tool_sessions(db: Database, cfg: Config, limit: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+    if limit is None:
+        limit = 50
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, _MAX_SESSIONS))
     rows = db.list_sessions(limit=limit)
     return {
+        "ok": True,
         "count": len(rows),
         "results": [
             {
@@ -113,12 +162,26 @@ def tool_sessions(db: Database, cfg: Config, limit: int = 50) -> dict[str, Any]:
     }
 
 
-def tool_forget(db: Database, cfg: Config, turn_id: int) -> dict[str, Any]:  # noqa: ARG001
-    deleted = db.delete_turn(int(turn_id))
-    return {"ok": deleted, "id": int(turn_id)}
+def tool_forget(db: Database, cfg: Config, turn_id: Any = None) -> dict[str, Any]:  # noqa: ARG001
+    """Soft-delete a turn by id. Idempotent: deleting an already-deleted or
+    nonexistent turn returns ok:False with a clear error.
+    """
+    if turn_id is None:
+        return {"ok": False, "error": "turn_id is required"}
+    try:
+        tid = int(turn_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "turn_id must be an integer"}
+    if tid < 1:
+        return {"ok": False, "error": "turn_id must be a positive integer"}
+    deleted = db.soft_delete_turn(tid)
+    if not deleted:
+        return {"ok": False, "id": tid, "error": "turn not found"}
+    return {"ok": True, "id": tid}
 
 
 def tool_stats(db: Database, cfg: Config) -> dict[str, Any]:
     s = db.stats()
     s["embedder"] = cfg.embedder.provider
+    s["ok"] = True
     return s

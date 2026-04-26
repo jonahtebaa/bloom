@@ -129,10 +129,22 @@ def recall(
     k: int = 5,
     session_id: str | None = None,
     candidate_multiplier: int = 3,
+    filter_session: str | None = None,
 ) -> list[ScoredTurn]:
-    """End-to-end recall: extract keywords, fetch candidates, score, return top-k."""
+    """End-to-end recall: extract keywords, fetch candidates, score, return top-k.
+
+    `session_id` boosts results from that session (soft preference). `filter_session`
+    hard-filters candidates so only that session's turns are considered.
+    """
     keywords = extract_keywords(query)
     if not keywords:
         return []
-    candidates = db.search_content(keywords, limit=k * candidate_multiplier)
+    # Pull a wider candidate pool when filtering, so we don't lose all matches
+    # when the target session has fewer hits than the multiplier expects.
+    fetch_limit = k * candidate_multiplier
+    if filter_session:
+        fetch_limit = max(fetch_limit, 200)
+    candidates = db.search_content(keywords, limit=fetch_limit)
+    if filter_session:
+        candidates = [r for r in candidates if r["session_id"] == filter_session]
     return score_turns(candidates, keywords, session_id=session_id)[:k]

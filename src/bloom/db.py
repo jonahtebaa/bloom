@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # FTS5 special characters that require quoting when used in MATCH queries.
 _FTS5_SPECIAL = re.compile(r"[^A-Za-z0-9_]")
@@ -151,6 +151,17 @@ class Database:
                 "SELECT id, content FROM turns "
                 "WHERE id NOT IN (SELECT rowid FROM turns_fts)"
             )
+        if from_version < 3:
+            # Soft-delete column. Existing rows default to NULL (live).
+            cols = {
+                row["name"]
+                for row in con.execute("PRAGMA table_info(turns)").fetchall()
+            }
+            if "deleted_at" not in cols:
+                con.execute("ALTER TABLE turns ADD COLUMN deleted_at INTEGER")
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_turns_deleted_at ON turns(deleted_at)"
+            )
         con.execute(
             "INSERT OR REPLACE INTO bloom_meta (key, value) VALUES ('schema_version', ?)",
             (int(SCHEMA_VERSION),),
@@ -195,6 +206,7 @@ class Database:
                         SELECT id, session_id, role, content, tags, ts
                         FROM turns
                         WHERE session_id = ?
+                          AND deleted_at IS NULL
                         ORDER BY ts DESC, id DESC
                         LIMIT ?
                     )
@@ -203,6 +215,18 @@ class Database:
                     (session_id, n),
                 ).fetchall()
             )
+
+    def fetch_by_id(self, turn_id: int) -> sqlite3.Row | None:
+        """Return a single live turn row by id, or None if missing/soft-deleted."""
+        with self.connect() as con:
+            return con.execute(
+                """
+                SELECT id, session_id, role, content, tags, ts
+                FROM turns
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (int(turn_id),),
+            ).fetchone()
 
     def search_content(self, keywords: list[str], limit: int) -> list[sqlite3.Row]:
         """Full-text search over `turns.content` via FTS5, ordered by bm25."""
@@ -223,6 +247,7 @@ class Database:
                         FROM turns_fts f
                         JOIN turns t ON t.id = f.rowid
                         WHERE turns_fts MATCH ?
+                          AND t.deleted_at IS NULL
                         ORDER BY bm25(turns_fts)
                         LIMIT ?
                         """,
@@ -249,7 +274,8 @@ class Database:
                       COALESCE(MAX(t.ts), s.started_at) AS last_ts,
                       COUNT(t.id) AS turn_count
                     FROM sessions s
-                    LEFT JOIN turns t ON t.session_id = s.id
+                    LEFT JOIN turns t
+                      ON t.session_id = s.id AND t.deleted_at IS NULL
                     GROUP BY s.id
                     ORDER BY last_ts DESC
                     LIMIT ?
@@ -259,18 +285,50 @@ class Database:
             )
 
     def delete_turn(self, turn_id: int) -> bool:
+        """Hard delete — kept for callers that want it. Tools use soft_delete_turn."""
         with self.connect() as con:
             cur = con.execute("DELETE FROM turns WHERE id = ?", (turn_id,))
             return cur.rowcount > 0
 
+    def soft_delete_turn(self, turn_id: int, ts: int | None = None) -> bool:
+        """Mark a turn as deleted without removing the row. Also evicts from FTS
+        so soft-deleted turns are invisible to keyword search.
+        """
+        ts = ts or int(time.time())
+        with self.connect() as con:
+            cur = con.execute(
+                """
+                UPDATE turns SET deleted_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (ts, int(turn_id)),
+            )
+            if cur.rowcount > 0:
+                # The UPDATE trigger re-inserts into turns_fts, so we explicitly
+                # delete the FTS row to keep soft-deleted content out of search.
+                con.execute(
+                    "INSERT INTO turns_fts(turns_fts, rowid, content) "
+                    "SELECT 'delete', id, content FROM turns WHERE id = ?",
+                    (int(turn_id),),
+                )
+                return True
+            return False
+
     def stats(self) -> dict[str, Any]:
         with self.connect() as con:
-            turns = con.execute("SELECT COUNT(*) AS c FROM turns").fetchone()["c"]
-            sessions = con.execute(
-                "SELECT COUNT(DISTINCT session_id) AS c FROM turns WHERE session_id IS NOT NULL"
+            turns = con.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE deleted_at IS NULL"
             ).fetchone()["c"]
-            oldest_row = con.execute("SELECT MIN(ts) AS t FROM turns").fetchone()
-            newest_row = con.execute("SELECT MAX(ts) AS t FROM turns").fetchone()
+            sessions = con.execute(
+                "SELECT COUNT(DISTINCT session_id) AS c FROM turns "
+                "WHERE session_id IS NOT NULL AND deleted_at IS NULL"
+            ).fetchone()["c"]
+            oldest_row = con.execute(
+                "SELECT MIN(ts) AS t FROM turns WHERE deleted_at IS NULL"
+            ).fetchone()
+            newest_row = con.execute(
+                "SELECT MAX(ts) AS t FROM turns WHERE deleted_at IS NULL"
+            ).fetchone()
             db_size = self.path.stat().st_size if self.path.exists() else 0
         return {
             "turns": int(turns),
