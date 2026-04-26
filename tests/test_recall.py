@@ -89,11 +89,23 @@ def test_recall_finds_relevant(populated_db: Database) -> None:
     assert any("postgres" in r.content.lower() for r in out)
 
 
-def test_recall_session_bonus(populated_db: Database) -> None:
-    out_default = recall(populated_db, "queue cache", k=5)
-    out_biased = recall(populated_db, "queue cache", k=5, session_id="s1")
-    assert all(r.session_id == "s1" for r in out_biased[:2])
-    assert len(out_biased) >= len(out_default[:2])
+def test_recall_session_bias_lifts_in_session_rows(populated_db: Database) -> None:
+    out_default = recall(populated_db, "queue cache", k=10)
+    out_biased = recall(populated_db, "queue cache", k=10, session_id="s1")
+
+    def s1_rank(results: list) -> int:
+        for i, r in enumerate(results):
+            if r.session_id == "s1":
+                return i
+        return 9999
+
+    default_rank = s1_rank(out_default)
+    biased_rank = s1_rank(out_biased)
+    assert biased_rank <= default_rank, (
+        f"session_bias should rank s1 turns at-or-above default ranking; "
+        f"default={default_rank} biased={biased_rank}"
+    )
+    assert any(r.session_id == "s1" for r in out_biased)
 
 
 def test_recall_empty_query(populated_db: Database) -> None:

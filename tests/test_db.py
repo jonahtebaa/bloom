@@ -31,6 +31,28 @@ def test_insert_and_fetch_recent(db: Database) -> None:
     assert rows[0]["content"] == "first"
 
 
+def test_fetch_recent_returns_newest_n_not_oldest(db: Database) -> None:
+    sid = "long-session"
+    for i in range(50):
+        db.insert_turn(f"turn-{i}", session_id=sid, ts=1000 + i)
+    rows = db.fetch_recent(sid, n=5)
+    assert [r["content"] for r in rows] == [
+        "turn-45",
+        "turn-46",
+        "turn-47",
+        "turn-48",
+        "turn-49",
+    ]
+
+
+def test_fetch_recent_caps_at_actual_count(db: Database) -> None:
+    sid = "small-session"
+    for i in range(3):
+        db.insert_turn(f"row-{i}", session_id=sid, ts=2000 + i)
+    rows = db.fetch_recent(sid, n=20)
+    assert [r["content"] for r in rows] == ["row-0", "row-1", "row-2"]
+
+
 def test_search_like(db: Database) -> None:
     db.insert_turn("the rain in spain")
     db.insert_turn("the lions sleep tonight")

@@ -237,13 +237,14 @@ def test_recent_n_negative_clamps_to_one(setup: tuple[Database, Config]) -> None
 
 def test_recent_n_huge_clamps_to_two_hundred(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
-    for i in range(3):
+    for i in range(250):
         tool_remember(db, cfg, content=f"row {i}", session="s1")
     out = tool_recent(db, cfg, session_id="s1", n=99_999)
     assert out["ok"] is True
-    # Only 3 actually exist, but the parameter would have been clamped to 200
-    # before hitting the DB — so result is min(actual, 200).
-    assert out["count"] == 3
+    assert out["count"] == 200
+    contents = [r["content"] for r in out["results"]]
+    assert contents[-1] == "row 249"
+    assert contents[0] == "row 50"
 
 
 def test_recent_n_none_uses_default(setup: tuple[Database, Config]) -> None:
