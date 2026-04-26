@@ -1,8 +1,29 @@
 # Bloom
 
-**Persistent cross-session memory for [Claude Code](https://claude.com/claude-code) and any MCP-compatible client.**
+**Persistent cross-session memory for [Claude Code](https://claude.com/claude-code) and any MCP-compatible client. Built to survive Opus 4.7's small context window.**
 
 Bloom is a single-file SQLite memory that survives between sessions. Ask Claude Code "what did we decide about X last week" and it can actually answer — by searching every prior turn it has saved.
+
+---
+
+## Why Bloom — the small-context problem
+
+If you've used Claude Opus 4.7 in long sessions, you already know the pain:
+
+- **Auto-compaction kicks in early.** 4.7's working context is tighter than 4.6's, so the model starts losing detail mid-session.
+- **Cross-session memory is zero.** Open a new session tomorrow and Claude has no idea what you decided today.
+- **`--resume` is one session.** It doesn't help when you're switching between projects, days, or machines.
+
+Bloom is the direct counter to that:
+
+1. **Recall on demand, not always-on.** `recall("the postgres decision")` pulls the exact original turn back into context only when needed — ~200 tokens to retrieve, vs. 20K to keep it loaded the whole session.
+2. **Session-end checkpointing.** `remember` the *conclusion* of a working session, throw away the verbose path. The next session resumes with the result, not the journey.
+3. **SessionStart hook = automatic warm-up.** Every new session opens with a short "recent memory" block injected at startup, so 4.7 doesn't begin empty.
+4. **Forever continuity.** 4.7's compaction is per-session and ephemeral; Bloom is persistent. Day 1's "we picked X" is queryable on day 30.
+
+The trick is keeping recall **out** of the model's context until it's needed. Loading 200 turns at session start would defeat the purpose. Loading the 5 most relevant on demand is the architecture.
+
+---
 
 ```
 $ pipx install bloom-mcp
