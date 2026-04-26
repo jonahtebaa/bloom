@@ -26,7 +26,7 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
         "session_id": row["session_id"],
         "role": row["role"],
         "content": row["content"],
-        "tags": row["tags"] if "tags" in row.keys() else None,
+        "tags": row["tags"] if "tags" in row.keys() else None,  # noqa: SIM118
         "ts": int(row["ts"] or 0),
     }
 

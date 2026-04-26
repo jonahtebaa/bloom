@@ -89,7 +89,7 @@ def score_turns(
                 content=r["content"] or "",
                 ts=int(r["ts"] or 0),
                 score=score,
-                tags=r["tags"] if "tags" in r.keys() else None,
+                tags=r["tags"] if "tags" in r.keys() else None,  # noqa: SIM118
             )
         )
     scored.sort(key=lambda x: x.score, reverse=True)

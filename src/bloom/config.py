@@ -53,7 +53,7 @@ class Config:
     snippet_max_chars: int = 600
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "Config":
+    def load(cls, path: Path | None = None) -> Config:
         cfg_path = path or default_config_path()
         data: dict[str, Any] = {}
         if cfg_path.exists():
@@ -62,7 +62,7 @@ class Config:
         return cls._from_dict(data)
 
     @classmethod
-    def _from_dict(cls, data: dict[str, Any]) -> "Config":
+    def _from_dict(cls, data: dict[str, Any]) -> Config:
         storage = data.get("storage", {})
         recall = data.get("recall", {})
         embedder = data.get("embedder", {})
