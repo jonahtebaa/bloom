@@ -1,10 +1,12 @@
 """Bloom CLI — entry point for `bloom-mcp` (and `python -m bloom`).
 
 Subcommands:
-  init       Interactive first-time setup wizard.
-  serve      Run the MCP server over stdio (what Claude Code invokes).
-  stats      Print DB stats.
-  register   Print or run the `claude mcp add` command for this install.
+  init           Interactive first-time setup wizard.
+  serve          Run the MCP server over stdio (what Claude Code invokes).
+  stats          Print DB stats.
+  register       Print or run the `claude mcp add` command for this install.
+  install-hook   Install Claude Code SessionStart hook so Bloom auto-recalls
+                 prior context at the start of every session.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from bloom import __version__
 from bloom.config import Config, EmbedderConfig, default_config_path, default_db_path, default_home
@@ -145,6 +148,17 @@ def cmd_init(args: argparse.Namespace) -> int:
         print('    claude mcp add bloom -- bloom-mcp serve')
 
     print()
+    print("Step 5 — Auto-recall on every Claude Code session (optional)")
+    print("  This installs a SessionStart hook so Claude Code automatically")
+    print("  loads recent Bloom memories at the start of every session.")
+    print("  Without this, Claude only uses Bloom when you explicitly ask.")
+    if _prompt_yes_no("  Install the SessionStart auto-recall hook?", default=True):
+        ok, msg = install_session_start_hook()
+        print(f"  {'✓' if ok else '✗'} {msg}")
+    else:
+        print("  Skipped. Run `bloom-mcp install-hook` later if you change your mind.")
+
+    print()
     print("Done. Try it:")
     print("    bloom-mcp stats")
     print("    bloom-mcp serve     # (Claude Code calls this for you)")
@@ -201,6 +215,101 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0 if _register_claude_code() else 1
 
 
+SESSION_START_HOOK_MARKER = "# bloom-mcp:session-start"
+
+
+def install_session_start_hook(
+    settings_path: Path | None = None,
+    n_recent: int = 5,
+) -> tuple[bool, str]:
+    """Wire a SessionStart hook into ~/.claude/settings.json so Claude Code
+    runs `bloom-mcp recent-print` at the start of every session.
+
+    Idempotent: re-running replaces the prior Bloom hook entry without
+    touching the user's other hooks.
+    """
+    settings_path = settings_path or (Path.home() / ".claude" / "settings.json")
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    settings: dict[str, Any] = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text() or "{}")
+        except json.JSONDecodeError:
+            return False, f"could not parse {settings_path} — fix the JSON and retry"
+
+    hooks = settings.setdefault("hooks", {})
+    session_start = hooks.setdefault("SessionStart", [])
+
+    bloom_cmd = f"bloom-mcp recall-print --k {n_recent} {SESSION_START_HOOK_MARKER}"
+    new_entry = {
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": bloom_cmd}],
+    }
+
+    if isinstance(session_start, list):
+        session_start = [
+            e for e in session_start
+            if not (
+                isinstance(e, dict)
+                and any(
+                    SESSION_START_HOOK_MARKER in (h.get("command") or "")
+                    for h in (e.get("hooks") or [])
+                    if isinstance(h, dict)
+                )
+            )
+        ]
+        session_start.append(new_entry)
+        hooks["SessionStart"] = session_start
+    else:
+        hooks["SessionStart"] = [new_entry]
+
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    return True, f"hook installed in {settings_path}"
+
+
+def cmd_install_hook(args: argparse.Namespace) -> int:
+    ok, msg = install_session_start_hook(n_recent=args.n)
+    print(f"{'✓' if ok else '✗'} {msg}")
+    return 0 if ok else 1
+
+
+def cmd_recall_print(args: argparse.Namespace) -> int:
+    """Print recent Bloom memories as plaintext — invoked by the SessionStart hook.
+
+    Output goes to stdout in a Claude-friendly format. Failures are silent
+    (we never want to break a session because Bloom can't read its DB).
+    """
+    try:
+        cfg = Config.load()
+        from bloom.db import Database
+
+        db = Database(cfg.db_path)
+        sessions = db.list_sessions(limit=args.k)
+        if not sessions:
+            return 0
+        lines = ["===== BLOOM MEMORY | recent sessions ====="]
+        for s in sessions:
+            ts = int(s["last_ts"] or 0)
+            from datetime import datetime, timezone
+
+            when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            lines.append(
+                f"  - [{when}] session={s['id']} ({s['turn_count']} turns)"
+            )
+        lines.append("")
+        lines.append(
+            "Bloom MCP tools available: recall(query, k), remember(content, session, tags),"
+        )
+        lines.append("recent(session_id, n), sessions(), forget(turn_id), stats().")
+        lines.append("Use `recall` whenever the user references prior work.")
+        lines.append("==========================================")
+        print("\n".join(lines))
+        return 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bloom-mcp",
@@ -226,6 +335,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the command instead of running it.",
     )
     p_reg.set_defaults(func=cmd_register)
+
+    p_hook = sub.add_parser(
+        "install-hook",
+        help="Install a Claude Code SessionStart hook so Bloom auto-fires every session.",
+    )
+    p_hook.add_argument("--n", type=int, default=5, help="Recent sessions to surface.")
+    p_hook.set_defaults(func=cmd_install_hook)
+
+    p_print = sub.add_parser(
+        "recall-print",
+        help="Print recent memory summary to stdout (used by the SessionStart hook).",
+    )
+    p_print.add_argument("--k", type=int, default=5, help="Number of recent sessions.")
+    p_print.add_argument("marker", nargs="?", help="Internal marker; ignored.")
+    p_print.set_defaults(func=cmd_recall_print)
 
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):

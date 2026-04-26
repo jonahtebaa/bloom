@@ -168,6 +168,7 @@ A first-party "team Bloom" mode is on the roadmap but not in v0.1.
 
 ## Documentation
 
+- **[Onboarding](docs/onboarding.md)** — 2-minute setup guide for new users
 - [Architecture](docs/architecture.md)
 - [Configuration reference](docs/configuration.md)
 - [Claude Code integration](docs/claude-code-integration.md)
