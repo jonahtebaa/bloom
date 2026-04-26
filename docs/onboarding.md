@@ -33,7 +33,13 @@ pipx install bloom-mcp
 uv tool install bloom-mcp
 ```
 
-### Option C — plain `pip`
+### Option C — Homebrew (macOS / Linuxbrew)
+
+```bash
+brew install jonahtebaa/bloom/bloom-mcp
+```
+
+### Option D — plain `pip`
 
 ```bash
 pip install --user bloom-mcp

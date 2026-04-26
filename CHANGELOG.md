@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Homebrew tap at [jonahtebaa/homebrew-bloom](https://github.com/jonahtebaa/homebrew-bloom).
+  Mac users can now install via `brew install jonahtebaa/bloom/bloom-mcp`.
+
 ## [0.2.0] - 2026-04-26
 
 ### Added
