@@ -1,13 +1,15 @@
 """Bloom CLI — entry point for `bloom-mcp` (and `python -m bloom`).
 
 Subcommands:
-  init           Interactive first-time setup wizard.
-  serve          Run the MCP server over stdio (what Claude Code invokes).
-  stats          Print DB stats.
-  register       Print or run the `claude mcp add` command for this install.
-  install-hook   Install Claude Code SessionStart hook so Bloom auto-recalls
-                 prior context at the start of every session.
-  recall-print   Print a recent-memory block to stdout (used by the hook).
+  init                  Interactive first-time setup wizard.
+  serve                 Run the MCP server over stdio (what Claude Code invokes).
+  stats                 Print DB stats.
+  register              Print or run the `claude mcp add` command for this install.
+  install-hook          Install Claude Code SessionStart hook so Bloom auto-recalls
+                        prior context at the start of every session.
+  recall-print          Print a recent-memory block to stdout (used by the hook).
+  backfill-embeddings   Compute embeddings for stored turns whose `embedding` is
+                        NULL (e.g. data written before an embedder was enabled).
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import getpass
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -495,6 +498,96 @@ def cmd_recall_print(args: argparse.Namespace) -> int:
         return 0
 
 
+# --- backfill-embeddings -----------------------------------------------------
+
+
+def cmd_backfill_embeddings(args: argparse.Namespace) -> int:
+    """Iterate rows where embedding IS NULL (and not soft-deleted), compute
+    embeddings in batches of `args.batch`, write back via `db.update_embedding`.
+    SIGINT stops cleanly and prints a summary of what was processed.
+    """
+    try:
+        cfg = Config.load()
+    except ConfigError as e:
+        print(f"bloom-mcp: configuration error: {e}", file=sys.stderr)
+        return 2
+
+    if cfg.embedder.provider == "none":
+        print(
+            "Embedder is set to `none` — nothing to backfill. "
+            "Run `bloom-mcp init` and pick openai/anthropic/local first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    from bloom.db import Database
+    from bloom.embedders import load_embedder
+
+    embedder = load_embedder(cfg.embedder)
+    if getattr(embedder, "dim", 0) <= 0:
+        print(
+            "Embedder failed to initialize (see warning above). "
+            "Check API key and optional dependency install.",
+            file=sys.stderr,
+        )
+        return 1
+
+    db = Database(cfg.db_path)
+    total = db.count_missing_embeddings()
+    if total == 0:
+        print("No rows need embedding — already fully backfilled.")
+        return 0
+
+    print(f"Backfilling embeddings for {total} turns using {embedder.name}...")
+
+    # Graceful SIGINT: flip a flag so the next batch boundary stops cleanly.
+    stop = {"requested": False}
+
+    def _on_sigint(_signum: int, _frame: Any) -> None:
+        stop["requested"] = True
+        print("\nStop requested — finishing current batch and exiting...", file=sys.stderr)
+
+    prev_handler = signal.signal(signal.SIGINT, _on_sigint)
+
+    processed = 0
+    failed = 0
+    try:
+        import numpy as np
+
+        for rows in db.iter_missing_embeddings(batch_size=args.batch):
+            if stop["requested"]:
+                break
+            texts = [r["content"] or "" for r in rows]
+            try:
+                if hasattr(embedder, "embed_batch"):
+                    vecs = embedder.embed_batch(texts)
+                else:
+                    vecs = [embedder.embed_doc(t) for t in texts]
+            except Exception as e:  # noqa: BLE001
+                failed += len(rows)
+                print(f"[bloom] batch failed ({e}) — skipping {len(rows)} rows", file=sys.stderr)
+                continue
+
+            for r, vec in zip(rows, vecs, strict=False):
+                arr = np.asarray(vec, dtype=np.float32)
+                if arr.size == 0:
+                    failed += 1
+                    continue
+                try:
+                    db.update_embedding(int(r["id"]), arr.tobytes())
+                    processed += 1
+                except Exception as e:  # noqa: BLE001
+                    failed += 1
+                    print(f"[bloom] write failed for id={r['id']}: {e}", file=sys.stderr)
+
+            print(f"  Processed {processed}/{total}…")
+    finally:
+        signal.signal(signal.SIGINT, prev_handler)
+
+    print(f"Done. processed={processed} failed={failed} remaining={total - processed - failed}")
+    return 0
+
+
 # --- argparse / main ---------------------------------------------------------
 
 
@@ -537,6 +630,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_print.add_argument("--k", type=int, default=5, help="Number of turns to surface.")
     p_print.set_defaults(func=cmd_recall_print)
+
+    p_back = sub.add_parser(
+        "backfill-embeddings",
+        help="Compute embeddings for any stored turns that don't have one yet.",
+    )
+    p_back.add_argument(
+        "--batch",
+        type=int,
+        default=100,
+        help="Batch size for embedder API calls (default: 100).",
+    )
+    p_back.set_defaults(func=cmd_backfill_embeddings)
 
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):

@@ -32,9 +32,10 @@ $ # Bloom is now wired into Claude Code. Open a new session and ask it to recall
 ```
 
 - **Works offline.** Default scoring is keyword + recency, backed by SQLite FTS5 — no API key, no network.
-- **Embedder hooks ready, not yet active.** OpenAI / Voyage / local adapters
-  are wired but unused in v0.2 — recall today is keyword + recency. Semantic
-  recall lands in v0.3 (see roadmap).
+- **Optional semantic recall.** Install `bloom-mcp[openai]` (or `[anthropic]` for
+  Voyage AI, or `[local]` for offline sentence-transformers), set the API key,
+  and recall re-ranks the top FTS5 candidates by cosine similarity. Falls back
+  cleanly to keyword-only on any embedder failure.
 - **Six MCP tools.** `recall`, `remember`, `recent`, `sessions`, `forget`, `stats`.
 - **One file, one process.** SQLite at `~/.bloom/loom.db`. No daemon, no Docker, no cloud.
 - **MIT-licensed.** Use it however you want.
@@ -89,7 +90,7 @@ Claude will call `recall("postgres migration")` and surface relevant past turns.
 **Bloom solves one problem: Claude Code forgets every session.** Even with `--resume`, you lose context across days/weeks/projects. Bloom adds a tiny memory layer:
 
 - **`remember`** — store a turn (decision, learning, summary) so future sessions can find it.
-- **`recall`** — search by query; get the top-k most relevant past turns ranked by keyword overlap (SQLite FTS5), recency, and — once v0.3 lands — semantic similarity.
+- **`recall`** — search by query; get the top-k most relevant past turns ranked by keyword overlap (SQLite FTS5), recency, and (when an embedder is configured) semantic similarity.
 - **`recent`** — pull the last N turns of a specific session.
 - **`sessions`** — list known sessions and their turn counts.
 - **`forget`** — delete a single turn by id.
@@ -113,14 +114,10 @@ print(tool_recall(db, cfg, query="queue choice"))
 
 ## Embedders (optional)
 
-> **Status (v0.2):** embedder support is wired but not yet active. Recall in
-> v0.2 uses keyword + recency scoring backed by SQLite FTS5. The adapters
-> below load and validate cleanly today; semantic search across stored
-> embeddings is the v0.3 milestone — see the roadmap.
-
-Bloom's default `none` embedder uses keyword + recency scoring. It's fast, offline, and good enough for most use cases.
-
-When v0.3 ships, you'll be able to pick one of:
+Bloom's default `none` embedder uses keyword + recency scoring backed by
+SQLite FTS5. It's fast, offline, and good enough for most use cases — turn
+it on only if you want semantic recall (queries that don't share keywords
+with the stored content).
 
 | Provider | Install | Auth | Cost |
 |---|---|---|---|
@@ -129,13 +126,51 @@ When v0.3 ships, you'll be able to pick one of:
 | `anthropic` (Voyage AI) | `pip install bloom-mcp[anthropic]` | `VOYAGE_API_KEY` | ~$0.02 / 1M tokens |
 | `local` | `pip install bloom-mcp[local]` | — (downloads model) | Free, ~80 MB |
 
-Set in `~/.bloom/config.toml` or via `bloom-mcp init`:
+### Enable
+
+Pick the provider in `bloom-mcp init` (Step 2) or edit `~/.bloom/config.toml`:
 
 ```toml
 [embedder]
 provider = "openai"
 model = "text-embedding-3-small"
 ```
+
+The wizard saves the API key to `~/.bloom/.env` (chmod 600) so the server
+picks it up without an extra shell-export step.
+
+### How it works
+
+- **Write path.** `remember` calls the embedder's `embed_doc(content)`,
+  serializes the float32 vector, and stores it in the row's `embedding` BLOB.
+- **Read path.** `recall` embeds the query *once*, then re-ranks the top
+  FTS5 candidates with `0.4 * bm25 + 0.5 * cosine + 0.1 * recency`.
+- **Failure modes are loud-stderr, never fatal.** If the network is down,
+  the API key is missing, or the optional package isn't installed, recall
+  silently degrades to keyword-only ranking and `remember` writes the row
+  with no embedding (it can be backfilled later).
+
+### Backfill
+
+If you enable an embedder *after* you've already used Bloom, you'll have
+rows with no embedding. Backfill them in one go:
+
+```bash
+bloom-mcp backfill-embeddings
+# Backfilling embeddings for 1500 turns using openai...
+#   Processed 100/1500…
+#   Processed 200/1500…
+#   ...
+```
+
+The command batches API calls (100 per request by default — tune with
+`--batch`), prints progress, handles Ctrl-C cleanly, and is safe to re-run.
+
+### Cost estimate
+
+For OpenAI's `text-embedding-3-small` at ~$0.02 / 1M tokens, an average
+turn of ~1000 tokens costs ~$0.00002. Embedding 10,000 turns end-to-end
+costs roughly **$0.20**.
 
 ---
 
@@ -192,7 +227,7 @@ A first-party "team Bloom" mode is on the roadmap but not in v0.1.
 
 - [x] v0.1 — initial SQLite-backed recall, six MCP tools, init wizard
 - [x] v0.2 — FTS5 keyword search, soft-delete, SessionStart auto-recall hook
-- [ ] v0.3 — embedding-augmented recall (hybrid keyword + cosine)
+- [x] v0.3 — embedding-augmented recall (hybrid keyword + cosine)
 - [ ] v0.4 — multi-tenant team mode (shared host, per-user namespaces)
 - [ ] v0.5 — pruning + compaction (auto-summarize old turns to save space)
 - [ ] v0.6 — alternative backends (Postgres, DuckDB)

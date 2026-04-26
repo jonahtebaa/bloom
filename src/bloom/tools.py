@@ -2,11 +2,16 @@
 
 Each function returns a JSON-serializable dict that the MCP server forwards
 verbatim to the client. Keep these pure — no console I/O, no global state
-besides the Database/Config passed in.
+besides the Database/Config/embedder passed in.
+
+The optional `embedder` argument is dependency-injected by the server. When
+absent, the data path matches the no-op embedder: keyword recall, no
+embedding columns written.
 """
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from bloom.config import Config
@@ -50,6 +55,36 @@ def _scored_to_dict(s: ScoredTurn, snippet_max: int) -> dict[str, Any]:
     }
 
 
+def _embed_doc_safely(embedder: Any | None, content: str) -> bytes | None:
+    """Compute a document embedding, swallow failures.
+
+    NEVER raises — embedder issues must not fail a `remember` call. Returns
+    raw float32 bytes ready to drop into the SQLite BLOB column, or None if
+    no embedder is configured / dim is 0 / the call failed.
+    """
+    if embedder is None or getattr(embedder, "dim", 0) <= 0:
+        return None
+    try:
+        vec = embedder.embed_doc(content)
+    except Exception as e:  # noqa: BLE001
+        print(f"[bloom] embed_doc failed: {e}", file=sys.stderr)
+        return None
+    if vec is None:
+        return None
+    try:
+        # Lazy numpy: we only get here when an embedder is wired in, which
+        # implies numpy is already present (the embedder uses it).
+        import numpy as np
+
+        arr = np.asarray(vec, dtype=np.float32)
+        if arr.size == 0:
+            return None
+        return arr.tobytes()
+    except Exception as e:  # noqa: BLE001
+        print(f"[bloom] embed_doc serialization failed: {e}", file=sys.stderr)
+        return None
+
+
 def tool_recall(
     db: Database,
     cfg: Config,
@@ -57,11 +92,14 @@ def tool_recall(
     k: int | None = None,
     session_bias: str | None = None,
     filter_session: str | None = None,
+    embedder: Any | None = None,
 ) -> dict[str, Any]:
-    """Search past turns by query — keyword + recency scored, top-k returned.
+    """Search past turns by query — keyword (+ optional cosine) + recency, top-k.
 
     `session_bias` (optional): boost results from that session.
     `filter_session` (optional): restrict results to that session only.
+    `embedder` (optional): when configured (dim > 0), re-rank candidates
+    with cosine similarity against stored document embeddings.
     """
     if k is None:
         k = cfg.retrieve_top_k
@@ -74,7 +112,14 @@ def tool_recall(
     bias = session_bias if session_bias else None
     flt = filter_session if filter_session else None
 
-    results = recall(db, query, k=k, session_id=bias, filter_session=flt)
+    results = recall(
+        db,
+        query,
+        k=k,
+        session_id=bias,
+        filter_session=flt,
+        embedder=embedder,
+    )
     return {
         "ok": True,
         "count": len(results),
@@ -89,8 +134,16 @@ def tool_remember(
     session: str | None = None,
     tags: str | None = None,
     role: str | None = _DEFAULT_ROLE,
+    embedder: Any | None = None,
 ) -> dict[str, Any]:
-    """Persist a single turn so future `recall` calls can surface it."""
+    """Persist a single turn so future `recall` calls can surface it.
+
+    If an embedder is configured (`embedder.dim > 0`), the document vector
+    is computed at write-time and stored in the row's `embedding` BLOB.
+    Embedder failures NEVER fail the remember call — we log to stderr and
+    insert without an embedding. The row can be backfilled later with
+    `bloom-mcp backfill-embeddings`.
+    """
     if not isinstance(content, str) or not content.strip():
         return {"ok": False, "error": "content is empty"}
     encoded_len = len(content.encode("utf-8"))
@@ -101,11 +154,14 @@ def tool_remember(
         }
     # Honor explicit role=None by falling back to default.
     effective_role = role if role else _DEFAULT_ROLE
+    stripped = content.strip()
+    embedding_bytes = _embed_doc_safely(embedder, stripped)
     turn_id = db.insert_turn(
-        content=content.strip(),
+        content=stripped,
         session_id=session,
         role=effective_role,
         tags=tags,
+        embedding=embedding_bytes,
     )
     row = db.fetch_by_id(turn_id)
     ts = int(row["ts"]) if row else 0

@@ -18,6 +18,7 @@ from mcp.server.stdio import stdio_server
 from bloom import __version__
 from bloom.config import Config
 from bloom.db import Database
+from bloom.embedders import load_embedder
 from bloom.tools import (
     tool_forget,
     tool_recall,
@@ -137,9 +138,15 @@ def _tool_definitions() -> list[mcp_types.Tool]:
 
 
 def build_server(cfg: Config | None = None) -> tuple[Server, Database, Config]:
-    """Wire up the Server with handlers bound to a Database + Config."""
+    """Wire up the Server with handlers bound to a Database + Config.
+
+    Loads the embedder ONCE at startup. If load_embedder fails (missing
+    optional dep, missing API key, init crash) it transparently returns the
+    no-op embedder, so a misconfigured embedder never prevents startup.
+    """
     cfg = cfg or Config.load()
     db = Database(cfg.db_path)
+    embedder = load_embedder(cfg.embedder)
     server: Server = Server("bloom-mcp", version=__version__)
 
     @server.list_tools()
@@ -150,9 +157,9 @@ def build_server(cfg: Config | None = None) -> tuple[Server, Database, Config]:
     async def _call_tool(name: str, arguments: dict[str, Any]) -> list[mcp_types.TextContent]:
         try:
             if name == "recall":
-                result = tool_recall(db, cfg, **arguments)
+                result = tool_recall(db, cfg, embedder=embedder, **arguments)
             elif name == "remember":
-                result = tool_remember(db, cfg, **arguments)
+                result = tool_remember(db, cfg, embedder=embedder, **arguments)
             elif name == "recent":
                 result = tool_recent(db, cfg, **arguments)
             elif name == "sessions":
@@ -180,8 +187,12 @@ async def run_stdio() -> None:
         level=cfg.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    log.info("bloom-mcp %s starting (db=%s, embedder=%s)",
-             __version__, cfg.db_path, cfg.embedder.provider)
+    log.info(
+        "bloom-mcp %s starting (db=%s, embedder=%s)",
+        __version__,
+        cfg.db_path,
+        cfg.embedder.provider,
+    )
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(

@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Embedders are now active.** When `embedder` is set to `openai`,
+  `anthropic` (Voyage AI), or `local` in `~/.bloom/config.toml`, `remember`
+  computes a document embedding at write-time and stores it in the row's
+  `embedding` BLOB; `recall` embeds the query once and re-ranks the top
+  FTS5 candidates with `0.4*bm25 + 0.5*cosine + 0.1*recency`. Failures
+  (missing optional dep, missing API key, network error, malformed blob)
+  fall back to keyword-only ranking and never crash the call.
+- `bloom-mcp backfill-embeddings` — iterates rows where `embedding IS
+  NULL` and writes embeddings in batches. Handles SIGINT cleanly.
+- New embedder protocol surface: `embed_doc(content)` and `embed_query(query)`
+  return numpy float32 arrays; `dim = 0` is the no-op sentinel.
+- `db.update_embedding`, `db.fetch_embeddings`, `db.iter_missing_embeddings`,
+  and `db.count_missing_embeddings` helpers (db.py stays numpy-free).
 - FTS5 search backend for content recall (replaces naive `LIKE` scan).
 - `filter_session` and `session_bias` as distinct arguments to `recall` —
   hard-filter to one session vs. soft-prefer it.

@@ -196,6 +196,78 @@ class Database:
                 )
             return int(cur.lastrowid)
 
+    def update_embedding(self, turn_id: int, blob: bytes | None) -> bool:
+        """Backfill or replace the embedding bytes for a turn. Returns True on hit."""
+        with self.connect() as con:
+            cur = con.execute(
+                "UPDATE turns SET embedding = ? WHERE id = ?",
+                (blob, int(turn_id)),
+            )
+            return cur.rowcount > 0
+
+    def fetch_embeddings(self, turn_ids: list[int]) -> dict[int, bytes]:
+        """Return `{id: embedding_bytes}` for the given ids, skipping nulls.
+
+        Pure data-shovel: does NOT deserialize or score. Callers (recall) own
+        the numpy/cosine math so this module stays numpy-free.
+        """
+        if not turn_ids:
+            return {}
+        # Chunk to stay under SQLite's variable limit on huge candidate pools.
+        out: dict[int, bytes] = {}
+        with self.connect() as con:
+            for i in range(0, len(turn_ids), 500):
+                chunk = turn_ids[i : i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                rows = con.execute(
+                    f"SELECT id, embedding FROM turns "
+                    f"WHERE id IN ({placeholders}) AND embedding IS NOT NULL",
+                    [int(t) for t in chunk],
+                ).fetchall()
+                for r in rows:
+                    blob = r["embedding"]
+                    if blob is not None:
+                        out[int(r["id"])] = bytes(blob)
+        return out
+
+    def iter_missing_embeddings(self, batch_size: int = 100) -> Iterator[list[sqlite3.Row]]:
+        """Yield batches of live rows whose `embedding` is NULL.
+
+        Used by the `backfill-embeddings` CLI command. Yields `(id, content)`
+        rows in id order; caller passes them through an embedder and writes
+        results back via `update_embedding`.
+        """
+        last_id = 0
+        with self.connect() as con:
+            while True:
+                rows = list(
+                    con.execute(
+                        """
+                        SELECT id, content
+                        FROM turns
+                        WHERE embedding IS NULL
+                          AND deleted_at IS NULL
+                          AND id > ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (last_id, int(batch_size)),
+                    ).fetchall()
+                )
+                if not rows:
+                    return
+                yield rows
+                last_id = int(rows[-1]["id"])
+
+    def count_missing_embeddings(self) -> int:
+        """Total live turns with a NULL embedding — for backfill progress display."""
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM turns "
+                "WHERE embedding IS NULL AND deleted_at IS NULL"
+            ).fetchone()
+            return int(row["c"])
+
     def fetch_recent(self, session_id: str, n: int = 20) -> list[sqlite3.Row]:
         """Return the most recent N turns for a session, sorted chronologically."""
         with self.connect() as con:
