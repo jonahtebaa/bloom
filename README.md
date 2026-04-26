@@ -31,6 +31,12 @@ The recommended way is [`pipx`](https://pypa.github.io/pipx/) (isolates Bloom fr
 pipx install bloom-mcp
 ```
 
+On macOS (or Linuxbrew) you can also use Homebrew:
+
+```bash
+brew install jonahtebaa/bloom/bloom-mcp
+```
+
 Or if you prefer plain `pip` / `uv`:
 
 ```bash
