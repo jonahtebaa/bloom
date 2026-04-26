@@ -36,6 +36,42 @@ def test_extract_keywords_caps_pinned_when_truncated() -> None:
     assert kws[0] == "cap_token"
 
 
+# ---------- code-token preservation (B5 regression) ------------------------
+
+
+def test_extract_keywords_preserves_cpp() -> None:
+    kws = extract_keywords("how do I write c++ code")
+    assert "c++" in kws
+    # And the bare `c` from the shredded `c++` must NOT also leak in.
+    assert "c" not in kws
+
+
+def test_extract_keywords_preserves_csharp_fsharp_dotnet() -> None:
+    kws = extract_keywords("comparing C# and F# on .NET runtime")
+    assert "c#" in kws
+    assert "f#" in kws
+    assert ".net" in kws
+
+
+def test_extract_keywords_preserves_k8s_i18n() -> None:
+    kws = extract_keywords("k8s deploys for i18n service")
+    assert "k8s" in kws
+    assert "i18n" in kws
+
+
+def test_recall_finds_cpp_row(tmp_path: Path) -> None:
+    """End-to-end: insert a c++ row, recall("c++"), confirm it surfaces."""
+    db = Database(tmp_path / "loom.db")
+    now = int(time.time())
+    cpp_id = db.insert_turn(
+        "we picked c++ for the inner loop performance", session_id="s1", ts=now
+    )
+    db.insert_turn("python is fine for tooling", session_id="s1", ts=now - 10)
+    out = recall(db, "c++ inner loop", k=3)
+    ids = [r.id for r in out]
+    assert cpp_id in ids, f"c++ row missing from results: {ids}"
+
+
 @pytest.fixture
 def populated_db(tmp_path: Path) -> Database:
     db = Database(tmp_path / "loom.db")
@@ -190,3 +226,97 @@ def test_recall_with_failing_embedder_falls_back(
     # And the failure was logged to stderr (not raised).
     err = capsys.readouterr().err
     assert "embed_query failed" in err
+
+
+# ---------- semantic-only retrieval (B3 regression) ------------------------
+
+
+def test_recall_semantic_only_finds_keyword_miss_match(tmp_path: Path) -> None:
+    """No shared keyword between query and target row; with an embedder
+    configured, the cosine-strong row must still surface via the semantic
+    candidate pool.
+
+    This is the README's "semantic recall finds keyword-miss matches"
+    contract — broken before the B3 fix because FTS5 returned zero
+    candidates and cosine never ran.
+    """
+    db = Database(tmp_path / "loom.db")
+    now = int(time.time())
+
+    query_text = "queue choice"
+    query_vec = [1.0, 0.0, 0.0, 0.0]
+
+    # Target row shares NO keyword with the query — only its embedding
+    # makes it semantically close.
+    target_id = _store_with_embedding(
+        db, "we picked postgres for the lock primitive",
+        np.asarray(query_vec), ts=now - 60,
+    )
+    # Distractors with no embedding overlap.
+    _store_with_embedding(
+        db, "redis is fine for caching", np.asarray([0.0, 1.0, 0.0, 0.0]),
+        ts=now - 120,
+    )
+
+    embedder = _FakeEmbedder({
+        query_text: query_vec,
+        "we picked postgres for the lock primitive": query_vec,
+        "redis is fine for caching": [0.0, 1.0, 0.0, 0.0],
+    })
+
+    out = recall(db, query_text, k=5, embedder=embedder)
+    ids = [r.id for r in out]
+    assert target_id in ids, (
+        f"semantic-only match should surface; got ids={ids}"
+    )
+
+
+# ---------- v1 → v3 migration FTS rebuild (B1 regression) ------------------
+
+
+def test_v1_db_migration_makes_old_rows_searchable(tmp_path: Path) -> None:
+    """Hand-build a v1-shape DB (no FTS, no deleted_at, schema_version=1)
+    with one row, then open it via Database(). Recall must find that row.
+
+    Before the B1 fix the migration's NOT-IN backfill silently failed for
+    external-content FTS5, leaving pre-v1 rows un-indexed and unsearchable.
+    """
+    import sqlite3 as _sqlite
+
+    db_path = tmp_path / "v1loom.db"
+    raw = _sqlite.connect(str(db_path))
+    raw.executescript(
+        """
+        CREATE TABLE bloom_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT NOT NULL,
+            tags TEXT,
+            embedding BLOB,
+            ts INTEGER NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            label TEXT,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER
+        );
+        INSERT INTO bloom_meta(key, value) VALUES('schema_version', '1');
+        INSERT INTO turns (session_id, role, content, ts)
+            VALUES ('s1', 'note', 'we picked postgres for the queue', 100);
+        INSERT INTO sessions (id, started_at) VALUES ('s1', 100);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    # Now open via Database — migration runs.
+    db = Database(db_path)
+
+    out = recall(db, "postgres queue", k=3)
+    contents = [r.content for r in out]
+    assert any("postgres" in c for c in contents), (
+        f"expected migrated v1 row to surface; got {contents}"
+    )

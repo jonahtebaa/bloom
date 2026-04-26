@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -47,6 +48,11 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # sqlite3.Connection is NOT thread-safe even for concurrent reads when
+        # shared across threads with check_same_thread=False — every method
+        # below serializes connection use with self._lock so threaded callers
+        # can't interleave executes and corrupt the cursor state.
+        self._lock = threading.RLock()
         self._con = sqlite3.connect(
             str(self.path), timeout=5.0, check_same_thread=False
         )
@@ -57,19 +63,25 @@ class Database:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        """Yield the cached connection. Kept for backwards compatibility —
-        the connection lifecycle is now owned by the Database instance.
+        """Yield the cached connection under the instance lock.
+
+        Acquires `self._lock` for the duration of the block so concurrent
+        callers from multiple threads never share a cursor mid-execute.
+        Re-entrant via RLock so methods that nest `with self.connect()`
+        (e.g. soft_delete_turn) don't deadlock.
         """
-        try:
-            yield self._con
-            self._con.commit()
-        except Exception:
-            self._con.rollback()
-            raise
+        with self._lock:
+            try:
+                yield self._con
+                self._con.commit()
+            except Exception:
+                self._con.rollback()
+                raise
 
     def close(self) -> None:
         try:
-            self._con.close()
+            with self._lock:
+                self._con.close()
         except Exception:
             pass
 
@@ -145,12 +157,14 @@ class Database:
                 END;
                 """
             )
-            # Backfill any pre-existing rows.
-            con.execute(
-                "INSERT INTO turns_fts(rowid, content) "
-                "SELECT id, content FROM turns "
-                "WHERE id NOT IN (SELECT rowid FROM turns_fts)"
-            )
+            # Backfill any pre-existing rows. We use FTS5's built-in 'rebuild'
+            # command rather than a per-row INSERT...WHERE NOT IN guard — for
+            # external-content FTS5 tables, that NOT IN against `turns_fts`
+            # does not behave as you'd hope (rowids without indexed terms still
+            # appear as NOT IN matches), which silently leaves pre-existing
+            # v1 rows unsearchable after migration. 'rebuild' reads from the
+            # external content table (turns) and reconstructs the index.
+            con.execute("INSERT INTO turns_fts(turns_fts) VALUES('rebuild')")
         if from_version < 3:
             # Soft-delete column. Existing rows default to NULL (live).
             cols = {
@@ -162,6 +176,27 @@ class Database:
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_turns_deleted_at ON turns(deleted_at)"
             )
+
+        # Belt-and-braces: if turns_fts exists but is empty while turns has
+        # rows (DB built by an older Bloom that hit the broken NOT IN
+        # backfill, or hand-rolled), rebuild the FTS index from the
+        # external content table so recall doesn't silently return zero.
+        try:
+            fts_count = con.execute(
+                "SELECT count(*) AS c FROM turns_fts"
+            ).fetchone()["c"]
+            turns_count = con.execute(
+                "SELECT count(*) AS c FROM turns"
+            ).fetchone()["c"]
+            if turns_count > 0 and fts_count == 0:
+                con.execute(
+                    "INSERT INTO turns_fts(turns_fts) VALUES('rebuild')"
+                )
+        except sqlite3.OperationalError:
+            # turns_fts didn't exist (shouldn't happen — migration above
+            # creates it), or rebuild failed. Skip rather than crash startup.
+            pass
+
         con.execute(
             "INSERT OR REPLACE INTO bloom_meta (key, value) VALUES ('schema_version', ?)",
             (int(SCHEMA_VERSION),),
@@ -300,8 +335,19 @@ class Database:
                 (int(turn_id),),
             ).fetchone()
 
-    def search_content(self, keywords: list[str], limit: int) -> list[sqlite3.Row]:
-        """Full-text search over `turns.content` via FTS5, ordered by bm25."""
+    def search_content(
+        self,
+        keywords: list[str],
+        limit: int,
+        session_filter: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Full-text search over `turns.content` via FTS5, ordered by bm25.
+
+        When `session_filter` is set, the WHERE clause is pushed into the
+        SQL so the LIMIT applies AFTER the session filter — preventing the
+        bug where N strong matches in another session displace the only
+        matching row in the requested session.
+        """
         if not keywords:
             return []
         # Build MATCH query: keywords OR'd, FTS5-special chars wrapped in quotes.
@@ -310,29 +356,66 @@ class Database:
         if not terms:
             return []
         match_query = " OR ".join(terms)
+        sql = (
+            "SELECT t.id, t.session_id, t.role, t.content, t.tags, t.ts "
+            "FROM turns_fts f "
+            "JOIN turns t ON t.id = f.rowid "
+            "WHERE turns_fts MATCH ? "
+            "  AND t.deleted_at IS NULL"
+        )
+        params: list[Any] = [match_query]
+        if session_filter is not None:
+            sql += " AND t.session_id = ?"
+            params.append(session_filter)
+        sql += " ORDER BY bm25(turns_fts) LIMIT ?"
+        params.append(limit)
         with self.connect() as con:
             try:
-                return list(
-                    con.execute(
-                        """
-                        SELECT t.id, t.session_id, t.role, t.content, t.tags, t.ts
-                        FROM turns_fts f
-                        JOIN turns t ON t.id = f.rowid
-                        WHERE turns_fts MATCH ?
-                          AND t.deleted_at IS NULL
-                        ORDER BY bm25(turns_fts)
-                        LIMIT ?
-                        """,
-                        (match_query, limit),
-                    ).fetchall()
-                )
+                return list(con.execute(sql, params).fetchall())
             except sqlite3.OperationalError:
                 # Malformed query or empty FTS table — return cleanly.
                 return []
 
-    def search_like(self, keywords: list[str], limit: int) -> list[sqlite3.Row]:
+    def search_like(
+        self,
+        keywords: list[str],
+        limit: int,
+        session_filter: str | None = None,
+    ) -> list[sqlite3.Row]:
         """Deprecated alias — delegates to `search_content`."""
-        return self.search_content(keywords, limit)
+        return self.search_content(keywords, limit, session_filter=session_filter)
+
+    def fetch_recent_with_embeddings(
+        self,
+        limit: int = 200,
+        exclude_session: str | None = None,
+        only_session: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return the most recent N live rows that have an embedding stored.
+
+        Used by recall's semantic candidate path so cosine similarity can
+        surface keyword-miss matches (e.g. "queue choice" finds "we picked
+        postgres for the lock primitive"). Ordered by `ts DESC, id DESC`.
+
+        `only_session` (optional): hard-filter to a single session_id.
+        `exclude_session` (optional): drop rows from a particular session.
+        """
+        sql = (
+            "SELECT id, session_id, role, content, tags, ts, embedding "
+            "FROM turns "
+            "WHERE deleted_at IS NULL AND embedding IS NOT NULL"
+        )
+        params: list[Any] = []
+        if only_session is not None:
+            sql += " AND session_id = ?"
+            params.append(only_session)
+        if exclude_session is not None:
+            sql += " AND (session_id IS NULL OR session_id != ?)"
+            params.append(exclude_session)
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        with self.connect() as con:
+            return list(con.execute(sql, params).fetchall())
 
     def list_sessions(self, limit: int = 50) -> list[sqlite3.Row]:
         # Read from `sessions` table joined with COUNT(*) over turns for accurate counts.

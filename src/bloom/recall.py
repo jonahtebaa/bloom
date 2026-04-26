@@ -50,9 +50,22 @@ _CJK_RUN = re.compile(r"[一-鿿가-힯]+")
 # the keyword list because they're high-signal (code/config references).
 _CAPS_TOKEN = re.compile(r"^[A-Z][A-Z0-9_]+$")
 
+# Code tokens that the default `\w+` tokenizer would shred — `c++` becomes
+# `c`, `c#` becomes `c`, `.NET` becomes `net`, etc. Match these BEFORE the
+# unicode pass and replace each match with a space so they're not double-
+# counted by the generic tokenizer.
+_CODE_TOKENS = re.compile(
+    r"(?:[Cc]\+\+|[CcFf]#|\.NET|\.[a-zA-Z][a-zA-Z0-9]*|k8s|i18n|l10n|[A-Za-z]\+\+)",
+    re.UNICODE,
+)
+
 # Embedder candidate pool — wider than the default keyword multiplier so the
 # cosine re-rank has enough variety to actually move things around.
 _EMBEDDER_CANDIDATE_LIMIT = 100
+
+# Default upper bound on the semantic candidate pool — capped so cosine
+# re-rank stays O(N) where N is bounded, even on multi-million-row DBs.
+_DEFAULT_SEMANTIC_POOL_SIZE = 200
 
 
 def extract_keywords(text: str, max_k: int = 8) -> list[str]:
@@ -61,11 +74,33 @@ def extract_keywords(text: str, max_k: int = 8) -> list[str]:
     Tokens are unicode word runs (`\\w+`) of length ≥2, plus continuous CJK
     runs, minus stopwords. ALL_CAPS / SNAKE_CAPS identifiers are pinned to
     the front of the result in their original order since they're high-signal.
+
+    A code-token whitelist (c++, c#, f#, .NET, k8s, i18n, l10n, .ext) runs
+    BEFORE the generic tokenizer because the unicode `\\w+` pass + 2-char
+    minimum would otherwise drop `c++` / `c#` entirely. Matched spans are
+    blanked out before generic tokenization to avoid double-counting.
     """
     if not text or not text.strip():
         return []
-    raw_tokens = re.findall(r"\w+", text, flags=re.UNICODE)
-    raw_tokens.extend(_CJK_RUN.findall(text))
+
+    # Pull out code tokens first so they survive the `\w+` shredder.
+    code_tokens: list[str] = []
+    code_seen: set[str] = set()
+
+    def _absorb(match: re.Match[str]) -> str:
+        tok = match.group(0)
+        lc = tok.lower()
+        if lc not in code_seen and lc not in _STOPWORDS:
+            code_tokens.append(lc)
+            code_seen.add(lc)
+        # Replace the match with spaces so the generic tokenizer doesn't
+        # recover a degraded form of the same token (e.g. `c` from `c++`).
+        return " " * len(tok)
+
+    scrubbed = _CODE_TOKENS.sub(_absorb, text)
+
+    raw_tokens = re.findall(r"\w+", scrubbed, flags=re.UNICODE)
+    raw_tokens.extend(_CJK_RUN.findall(scrubbed))
 
     seen: list[str] = []
     seen_lc: set[str] = set()
@@ -89,7 +124,15 @@ def extract_keywords(text: str, max_k: int = 8) -> list[str]:
     for c in caps_in_order:
         if c in seen:
             seen.remove(c)
-    final = caps_in_order + seen
+    # Code tokens go in front of caps tokens — they're the most specific
+    # signal the user could give us (a literal language/tech reference).
+    # Then caps tokens (config/identifiers), then everything else.
+    final: list[str] = []
+    final_seen: set[str] = set()
+    for tok in code_tokens + caps_in_order + seen:
+        if tok not in final_seen:
+            final.append(tok)
+            final_seen.add(tok)
     return final[:max_k]
 
 
@@ -201,7 +244,13 @@ def _score_with_embedder(
     max_rec = max(rec_raw) if rec_raw else 1.0
     rec_norm = [r / max_rec for r in rec_raw] if max_rec > 0 else [0.0] * n
 
+    # Minimum cosine for a keyword-miss row to qualify as a semantic match.
+    # Below this we treat the row as noise (zero-vec, mismatched dim, or
+    # genuinely unrelated) and drop it.
+    SEM_MIN_COSINE = 0.2
+
     scored: list[ScoredTurn] = []
+    cosines: list[float] = []
     for i, r in enumerate(rows):
         rid = int(r["id"])
         blob = id_to_blob.get(rid)
@@ -213,6 +262,7 @@ def _score_with_embedder(
                     cosine = _cosine(query_vec, doc_vec)
             except Exception:  # noqa: BLE001 — bad blob, skip cosine.
                 cosine = 0.0
+        cosines.append(cosine)
 
         # Same-session soft bias: small additive nudge so it doesn't dominate
         # the normalized hybrid score.
@@ -233,13 +283,14 @@ def _score_with_embedder(
             )
         )
 
-    # Filter to rows that have at least *some* keyword overlap — prevents
-    # cosine-only matches from polluting results when the user typed a
-    # specific keyword query. (Mirrors `score_turns`'s hits>0 gate.)
+    # Keep a row if it has either keyword overlap OR a meaningful cosine.
+    # The keyword-overlap path mirrors `score_turns`; the cosine path lets
+    # semantic-only matches (no shared keyword with the query) survive.
     kw_filtered: list[ScoredTurn] = []
-    for s in scored:
+    for s, cos in zip(scored, cosines, strict=False):
         cl = (s.content or "").lower()
-        if not keywords or any(k in cl for k in keywords):
+        kw_hit = not keywords or any(k in cl for k in keywords)
+        if kw_hit or cos >= SEM_MIN_COSINE:
             kw_filtered.append(s)
     kw_filtered.sort(key=lambda x: x.score, reverse=True)
     return kw_filtered
@@ -253,17 +304,21 @@ def recall(
     candidate_multiplier: int = 3,
     filter_session: str | None = None,
     embedder: Any | None = None,
+    semantic_pool_size: int = _DEFAULT_SEMANTIC_POOL_SIZE,
 ) -> list[ScoredTurn]:
     """End-to-end recall: extract keywords, fetch candidates, score, return top-k.
 
     `session_id` boosts results from that session (soft preference). `filter_session`
-    hard-filters candidates so only that session's turns are considered.
+    hard-filters candidates so only that session's turns are considered (pushed
+    down into the SQL so the LIMIT applies AFTER the session filter).
     `embedder` (optional): if provided and `embedder.dim > 0`, augments scoring
-    with cosine similarity over stored document embeddings.
+    with cosine similarity. The candidate pool is the union of (a) the FTS5
+    keyword candidates and (b) up to `semantic_pool_size` recent rows that
+    have an embedding stored — so semantic-only matches (no shared keyword
+    with the query) still surface. This is O(N) per query where N is bounded
+    by `semantic_pool_size`; a future ANN index would lift the bound.
     """
     keywords = extract_keywords(query)
-    if not keywords:
-        return []
 
     use_embedder = embedder is not None and getattr(embedder, "dim", 0) > 0
 
@@ -274,22 +329,65 @@ def recall(
         # Widen the pool so the cosine re-rank has enough material.
         fetch_limit = max(fetch_limit, _EMBEDDER_CANDIDATE_LIMIT)
 
-    candidates = db.search_content(keywords, limit=fetch_limit)
-    if filter_session:
-        candidates = [r for r in candidates if r["session_id"] == filter_session]
+    # Keyword/FTS candidates (fast path). filter_session is pushed into the
+    # SQL so the LIMIT applies AFTER the WHERE — without this, N strong
+    # cross-session matches displace the only in-session row.
+    if keywords:
+        candidates = db.search_content(
+            keywords, limit=fetch_limit, session_filter=filter_session
+        )
+    else:
+        candidates = []
 
     if not use_embedder:
+        if not keywords:
+            return []
         return score_turns(candidates, keywords, session_id=session_id)[:k]
 
     query_vec = _safe_query_embed(embedder, query)
     if query_vec is None or query_vec.size == 0:
         # Embedding failed — degrade gracefully to keyword-only scoring.
+        if not keywords:
+            return []
         return score_turns(candidates, keywords, session_id=session_id)[:k]
 
-    id_to_blob = db.fetch_embeddings([int(r["id"]) for r in candidates])
+    # Semantic candidate pool: most-recent rows with stored embeddings.
+    # We compute cosine for each and take the top M so a query with NO
+    # shared keyword can still find a row by meaning alone.
+    semantic_pool = db.fetch_recent_with_embeddings(
+        limit=int(semantic_pool_size),
+        only_session=filter_session,
+    )
+    semantic_top = _semantic_topk(
+        semantic_pool,
+        query_vec,
+        embedder_dim=int(getattr(embedder, "dim", 0)),
+        top_m=max(k * 5, 50),
+    )
+
+    # Union the two pools, dedup by id, and run hybrid scoring on the union.
+    seen_ids: set[int] = set()
+    union: list[sqlite3.Row] = []
+    for r in candidates:
+        rid = int(r["id"])
+        if rid in seen_ids:
+            continue
+        seen_ids.add(rid)
+        union.append(r)
+    for r in semantic_top:
+        rid = int(r["id"])
+        if rid in seen_ids:
+            continue
+        seen_ids.add(rid)
+        union.append(r)
+
+    if not union:
+        return []
+
+    id_to_blob = db.fetch_embeddings([int(r["id"]) for r in union])
     now = int(time.time())
     scored = _score_with_embedder(
-        candidates,
+        union,
         keywords,
         query_vec,
         id_to_blob,
@@ -298,3 +396,36 @@ def recall(
         now=now,
     )
     return scored[:k]
+
+
+def _semantic_topk(
+    rows: list[sqlite3.Row],
+    query_vec: "np.ndarray",
+    embedder_dim: int,
+    top_m: int,
+) -> list[sqlite3.Row]:
+    """Return the top-M rows from `rows` by cosine similarity to query_vec.
+
+    Rows must already have an `embedding` BLOB populated. Rows with bad
+    blobs or mismatched dim are skipped silently rather than excluded
+    from the broader pool — they just rank at the bottom (cosine 0).
+    """
+    if not rows:
+        return []
+    import numpy as np
+
+    scored: list[tuple[float, sqlite3.Row]] = []
+    for r in rows:
+        blob = r["embedding"]
+        if blob is None:
+            continue
+        try:
+            doc_vec = np.frombuffer(bytes(blob), dtype=np.float32)
+        except Exception:  # noqa: BLE001
+            continue
+        if doc_vec.size != embedder_dim:
+            continue
+        sim = _cosine(query_vec, doc_vec)
+        scored.append((sim, r))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [r for _sim, r in scored[:top_m]]

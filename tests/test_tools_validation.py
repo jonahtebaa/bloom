@@ -72,6 +72,34 @@ def test_recall_filter_session_restricts_results(setup: tuple[Database, Config])
     assert all(r["session_id"] == "s1" for r in out["results"])
 
 
+def test_recall_filter_session_pushes_through_limit(setup: tuple[Database, Config]) -> None:
+    """Stress version of the filter_session contract.
+
+    Before the B2 fix recall fetched FTS candidates globally then
+    post-filtered AFTER the limit cap. With 250 stronger matches in s2 and
+    only 1 weak match in s1, filter_session="s1" returned zero. With the
+    push-down, the s1 row must still be returned.
+    """
+    db, cfg = setup
+    # 250 strong-match rows in s2.
+    for i in range(250):
+        tool_remember(
+            db,
+            cfg,
+            content=f"postgres postgres postgres queue lock row {i}",
+            session="s2",
+        )
+    # Single weak-match row in s1.
+    tool_remember(db, cfg, content="postgres mention here", session="s1")
+
+    out = tool_recall(db, cfg, query="postgres queue", filter_session="s1", k=5)
+    assert out["ok"] is True
+    assert out["count"] >= 1, (
+        f"filter_session push-down failed; got {out}"
+    )
+    assert all(r["session_id"] == "s1" for r in out["results"])
+
+
 def test_recall_session_bias_boosts_but_does_not_filter(setup: tuple[Database, Config]) -> None:
     db, cfg = setup
     tool_remember(db, cfg, content="postgres only mention", session="s1")
