@@ -31,8 +31,10 @@ $ bloom-mcp init
 $ # Bloom is now wired into Claude Code. Open a new session and ask it to recall.
 ```
 
-- **Works offline.** Default scoring is keyword + recency — no API key, no network.
-- **Optional embeddings.** OpenAI, Voyage (Anthropic-recommended), or local sentence-transformers.
+- **Works offline.** Default scoring is keyword + recency, backed by SQLite FTS5 — no API key, no network.
+- **Embedder hooks ready, not yet active.** OpenAI / Voyage / local adapters
+  are wired but unused in v0.2 — recall today is keyword + recency. Semantic
+  recall lands in v0.3 (see roadmap).
 - **Six MCP tools.** `recall`, `remember`, `recent`, `sessions`, `forget`, `stats`.
 - **One file, one process.** SQLite at `~/.bloom/loom.db`. No daemon, no Docker, no cloud.
 - **MIT-licensed.** Use it however you want.
@@ -50,12 +52,6 @@ The recommended way is [`pipx`](https://pypa.github.io/pipx/) (isolates Bloom fr
 
 ```bash
 pipx install bloom-mcp
-```
-
-On macOS (or Linuxbrew) you can also use Homebrew:
-
-```bash
-brew install jonahtebaa/bloom/bloom-mcp
 ```
 
 Or if you prefer plain `pip` / `uv`:
@@ -93,7 +89,7 @@ Claude will call `recall("postgres migration")` and surface relevant past turns.
 **Bloom solves one problem: Claude Code forgets every session.** Even with `--resume`, you lose context across days/weeks/projects. Bloom adds a tiny memory layer:
 
 - **`remember`** — store a turn (decision, learning, summary) so future sessions can find it.
-- **`recall`** — search by query; get the top-k most relevant past turns ranked by keyword overlap, recency, and (optionally) semantic similarity.
+- **`recall`** — search by query; get the top-k most relevant past turns ranked by keyword overlap (SQLite FTS5), recency, and — once v0.3 lands — semantic similarity.
 - **`recent`** — pull the last N turns of a specific session.
 - **`sessions`** — list known sessions and their turn counts.
 - **`forget`** — delete a single turn by id.
@@ -117,9 +113,14 @@ print(tool_recall(db, cfg, query="queue choice"))
 
 ## Embedders (optional)
 
+> **Status (v0.2):** embedder support is wired but not yet active. Recall in
+> v0.2 uses keyword + recency scoring backed by SQLite FTS5. The adapters
+> below load and validate cleanly today; semantic search across stored
+> embeddings is the v0.3 milestone — see the roadmap.
+
 Bloom's default `none` embedder uses keyword + recency scoring. It's fast, offline, and good enough for most use cases.
 
-If you want semantic search ("find turns about *that thing we discussed*" without needing the exact words), pick one of:
+When v0.3 ships, you'll be able to pick one of:
 
 | Provider | Install | Auth | Cost |
 |---|---|---|---|
@@ -158,7 +159,10 @@ provider = "none"
 level = "INFO"
 ```
 
-All values can also be set via env vars: `BLOOM_DB_PATH`, `BLOOM_EMBEDDER`, `BLOOM_LOG_LEVEL`.
+All values can also be set via env vars: `BLOOM_DB_PATH`, `BLOOM_EMBEDDER`,
+`BLOOM_EMBEDDER_MODEL`, `BLOOM_RETRIEVE_TOP_K`, `BLOOM_LOG_LEVEL`,
+`BLOOM_HOME`. Any keys saved to `~/.bloom/.env` (e.g. by the `init` wizard)
+are auto-loaded into the environment on startup.
 
 ---
 
@@ -186,10 +190,12 @@ A first-party "team Bloom" mode is on the roadmap but not in v0.1.
 
 ## Roadmap
 
-- [ ] v0.2 — embedding-augmented recall (hybrid keyword + cosine)
-- [ ] v0.3 — multi-tenant team mode (shared host, per-user namespaces)
-- [ ] v0.4 — pruning + compaction (auto-summarize old turns to save space)
-- [ ] v0.5 — alternative backends (Postgres, DuckDB)
+- [x] v0.1 — initial SQLite-backed recall, six MCP tools, init wizard
+- [x] v0.2 — FTS5 keyword search, soft-delete, SessionStart auto-recall hook
+- [ ] v0.3 — embedding-augmented recall (hybrid keyword + cosine)
+- [ ] v0.4 — multi-tenant team mode (shared host, per-user namespaces)
+- [ ] v0.5 — pruning + compaction (auto-summarize old turns to save space)
+- [ ] v0.6 — alternative backends (Postgres, DuckDB)
 
 ---
 
