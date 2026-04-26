@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from unittest import mock
@@ -10,6 +11,7 @@ from bloom.cli import (
     BLOOM_MARKER_FIELD,
     BLOOM_MARKER_VALUE,
     SESSION_START_HOOK_MARKER,
+    cmd_recall_print,
     install_session_start_hook,
 )
 
@@ -109,6 +111,34 @@ def test_install_hook_uses_atomic_replace(tmp_path: Path) -> None:
     src, dst = args
     assert str(dst) == str(settings)
     assert str(src).endswith(".json.tmp")
+
+
+def test_recall_print_writes_error_log_on_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A broken Config.load inside cmd_recall_print → log file is written, exit 0."""
+    bloom_home = tmp_path / "bloom-home"
+    bloom_home.mkdir()
+    monkeypatch.setenv("BLOOM_HOME", str(bloom_home))
+    monkeypatch.delenv("BLOOM_DEBUG", raising=False)
+
+    log = bloom_home / "last_hook_error.log"
+    assert not log.exists()
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("simulated config explosion")
+
+    monkeypatch.setattr("bloom.cli.Config.load", boom)
+
+    args = argparse.Namespace(k=5)
+    rc = cmd_recall_print(args)
+
+    # Hook MUST never break the session, regardless of what blew up.
+    assert rc == 0
+    assert log.exists(), "expected hook error log to be written on failure"
+    text = log.read_text()
+    assert "RuntimeError" in text
+    assert "simulated config explosion" in text
 
 
 def test_install_hook_upgrades_legacy_marker(tmp_path: Path) -> None:

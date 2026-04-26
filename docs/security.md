@@ -35,11 +35,34 @@ API key. The install wizard writes it to `~/.bloom/.env` with mode 0600 (user
 read/write only). You can also set the key via your shell environment, in which
 case Bloom never persists it.
 
-Bloom **never** sends your `loom.db` content to embedder providers in bulk. It
-only sends individual turn text at the moment of `remember` (to embed it) or
-the query string at the moment of `recall` (to embed the query). If you want
-zero outbound network traffic, use `embedder.provider = "none"` (the default)
-or `local`.
+### Outbound data flow per embedder choice
+
+By default, Bloom is **offline**: keyword + recency FTS5 ranking, zero
+network. The `none` embedder is the recommended default for exactly this
+reason.
+
+When you enable an embedder, each `remember` call sends the new turn's
+content to the configured embedding provider, and each `recall` sends
+the query string. Specifically:
+
+- `local` (sentence-transformers) — runs on-device. The model is
+  downloaded once on first use; nothing leaves the machine after that.
+- `openai` — turn content and query text are sent over HTTPS to OpenAI's
+  embeddings endpoint. Subject to OpenAI's data-handling policy.
+- `anthropic` (Voyage AI) — turn content and query text are sent over
+  HTTPS to Voyage's endpoint. Subject to Voyage's data-handling policy.
+
+`bloom-mcp backfill-embeddings` is the one **bulk** operation Bloom
+performs: it sends every existing live turn (without an embedding) to
+the configured embedder. That can be hundreds or thousands of rows in
+one go. Run it only when you trust the provider with your full memory
+store. As a safety rail, the command **requires `--confirm`** for cloud
+embedders (`openai`, `anthropic`) — without it, the command refuses and
+prints what it would have sent. The `local` embedder doesn't need
+`--confirm` because nothing leaves the machine.
+
+If you want zero outbound network traffic, use `embedder.provider = "none"`
+(the default) or `local`.
 
 ## Multi-user systems
 

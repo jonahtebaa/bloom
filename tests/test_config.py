@@ -63,7 +63,8 @@ def test_malformed_toml_raises_config_error(tmp_path: Path) -> None:
     assert str(bad) in str(excinfo.value)
 
 
-def test_load_env_sets_unset_vars(monkeypatch, tmp_path: Path) -> None:
+def test_load_env_sets_secret_vars_only(monkeypatch, tmp_path: Path) -> None:
+    """`.env` injects secrets but ignores BLOOM_* config keys (whitelist)."""
     env_file = tmp_path / ".env"
     env_file.write_text(
         "# a comment\n"
@@ -82,7 +83,54 @@ def test_load_env_sets_unset_vars(monkeypatch, tmp_path: Path) -> None:
 
     assert os.environ.get("OPENAI_API_KEY") == "sk-from-env-file"
     assert os.environ.get("VOYAGE_API_KEY") == "quoted-value"
-    assert os.environ.get("BLOOM_LOG_LEVEL") == "DEBUG"
+    # BLOOM_* keys are NEVER pulled from .env — config.toml is canonical.
+    assert os.environ.get("BLOOM_LOG_LEVEL") is None
+
+
+def test_load_env_ignores_bloom_keys_with_warning(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """`BLOOM_EMBEDDER` in .env is ignored and a warning is printed."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("BLOOM_EMBEDDER=local\n")
+    monkeypatch.delenv("BLOOM_EMBEDDER", raising=False)
+
+    _load_env(env_file)
+
+    import os
+
+    assert os.environ.get("BLOOM_EMBEDDER") is None
+    err = capsys.readouterr().err
+    assert "BLOOM_*" in err
+    assert "config.toml" in err
+
+
+def test_config_toml_wins_over_env_file_for_bloom_keys(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """config.toml `embedder = "openai"` + .env BLOOM_EMBEDDER=local → openai."""
+    home = tmp_path / "bloom-home"
+    home.mkdir()
+    cfg_path = home / "config.toml"
+    cfg_path.write_text(
+        '[embedder]\nprovider = "openai"\nmodel = "text-embedding-3-small"\n'
+    )
+    env_file = home / ".env"
+    env_file.write_text(
+        "OPENAI_API_KEY=sk-test\nBLOOM_EMBEDDER=local\n"
+    )
+    monkeypatch.setenv("BLOOM_HOME", str(home))
+    monkeypatch.delenv("BLOOM_EMBEDDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    cfg = Config.load(cfg_path)
+
+    import os
+
+    # config.toml wins; .env's BLOOM_EMBEDDER was filtered out.
+    assert cfg.embedder.provider == "openai"
+    # API key was injected from .env so the embedder can authenticate.
+    assert os.environ.get("OPENAI_API_KEY") == "sk-test"
 
 
 def test_load_env_does_not_overwrite_existing(monkeypatch, tmp_path: Path) -> None:

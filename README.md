@@ -69,11 +69,16 @@ uv tool install bloom-mcp
 bloom-mcp init
 ```
 
-The wizard will:
+The wizard runs five steps:
 1. Pick a database location (default: `~/.bloom/loom.db`).
 2. Choose an embedder (`none` is recommended — works offline, no API key).
-3. Tune recall settings.
-4. Register Bloom with Claude Code automatically (if `claude` is on your PATH).
+   If you pick `openai`, `anthropic` (Voyage), or `local`, it can also
+   capture the API key into `~/.bloom/.env` (chmod 600).
+3. Tune recall settings (`top_k`, max snippet chars).
+4. Optionally register Bloom with Claude Code (`claude mcp add ...`).
+   Defaults to **no** — re-run `bloom-mcp register` later if you change your mind.
+5. Optionally install the SessionStart auto-recall hook so every Claude
+   Code session opens with a recent-memory block.
 
 ### 3. Use it
 
@@ -93,7 +98,9 @@ Claude will call `recall("postgres migration")` and surface relevant past turns.
 - **`recall`** — search by query; get the top-k most relevant past turns ranked by keyword overlap (SQLite FTS5), recency, and (when an embedder is configured) semantic similarity.
 - **`recent`** — pull the last N turns of a specific session.
 - **`sessions`** — list known sessions and their turn counts.
-- **`forget`** — delete a single turn by id.
+- **`forget`** — soft-delete a single turn by id (recoverable: the row is
+  marked with `deleted_at` and hidden from recall, but the content is still
+  in the SQLite file until you run `bloom-mcp purge --hard`).
 - **`stats`** — DB size, schema version, embedder.
 
 You can use it as a Python library too:
@@ -143,8 +150,16 @@ picks it up without an extra shell-export step.
 
 - **Write path.** `remember` calls the embedder's `embed_doc(content)`,
   serializes the float32 vector, and stores it in the row's `embedding` BLOB.
-- **Read path.** `recall` embeds the query *once*, then re-ranks the top
-  FTS5 candidates with `0.4 * bm25 + 0.5 * cosine + 0.1 * recency`.
+- **Read path.** When an embedder is configured, `recall` searches **two
+  pools**: the FTS5 keyword candidates *and* a semantic pool (the most
+  recent N rows that have an embedding, default 200) ranked by cosine
+  similarity to the query embedding. The two pools are unioned and scored
+  with `0.4 * bm25 + 0.5 * cosine + 0.1 * recency` — so a query that
+  shares no keywords with the stored turn ("queue choice" → "we picked
+  postgres SKIP LOCKED for the worker pipeline") can still surface by
+  meaning alone. The semantic pool size is configurable via
+  `[semantic] pool_size = 200` in `config.toml` or
+  the `semantic_pool_size` argument to `recall()`.
 - **Failure modes are loud-stderr, never fatal.** If the network is down,
   the API key is missing, or the optional package isn't installed, recall
   silently degrades to keyword-only ranking and `remember` writes the row
@@ -156,7 +171,7 @@ If you enable an embedder *after* you've already used Bloom, you'll have
 rows with no embedding. Backfill them in one go:
 
 ```bash
-bloom-mcp backfill-embeddings
+bloom-mcp backfill-embeddings --confirm
 # Backfilling embeddings for 1500 turns using openai...
 #   Processed 100/1500…
 #   Processed 200/1500…
@@ -165,6 +180,11 @@ bloom-mcp backfill-embeddings
 
 The command batches API calls (100 per request by default — tune with
 `--batch`), prints progress, handles Ctrl-C cleanly, and is safe to re-run.
+
+`--confirm` is **required** for cloud embedders (`openai`, `anthropic`)
+because backfill is the one bulk-send operation Bloom performs — without
+the flag it refuses to upload your full memory store. Local
+sentence-transformers (`local`) stays on-device and skips the prompt.
 
 ### Cost estimate
 
@@ -196,8 +216,13 @@ level = "INFO"
 
 All values can also be set via env vars: `BLOOM_DB_PATH`, `BLOOM_EMBEDDER`,
 `BLOOM_EMBEDDER_MODEL`, `BLOOM_RETRIEVE_TOP_K`, `BLOOM_LOG_LEVEL`,
-`BLOOM_HOME`. Any keys saved to `~/.bloom/.env` (e.g. by the `init` wizard)
-are auto-loaded into the environment on startup.
+`BLOOM_HOME`, `BLOOM_DEBUG`.
+
+`~/.bloom/.env` is a **secrets-only** sidecar — Bloom reads it after
+`config.toml` and only injects credential-shaped keys (e.g. `OPENAI_API_KEY`,
+`VOYAGE_API_KEY`) into the environment. Any `BLOOM_*` line in `.env` is
+ignored with a one-line stderr warning so config can't be silently
+overridden by a stale `.env` file.
 
 ---
 

@@ -4,12 +4,15 @@ Subcommands:
   init                  Interactive first-time setup wizard.
   serve                 Run the MCP server over stdio (what Claude Code invokes).
   stats                 Print DB stats.
+  doctor                Print diagnostics + last hook error (if any).
   register              Print or run the `claude mcp add` command for this install.
   install-hook          Install Claude Code SessionStart hook so Bloom auto-recalls
                         prior context at the start of every session.
   recall-print          Print a recent-memory block to stdout (used by the hook).
   backfill-embeddings   Compute embeddings for stored turns whose `embedding` is
-                        NULL (e.g. data written before an embedder was enabled).
+                        NULL (requires `--confirm` because it bulk-sends content
+                        to the configured cloud provider).
+  purge                 Hard-delete soft-deleted rows (`--hard` required).
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,8 +38,16 @@ from bloom.config import (
     EmbedderConfig,
     default_config_path,
     default_db_path,
+    default_env_path,
     default_home,
 )
+
+
+# Path to a one-line error log written by `recall-print` so failures
+# inside the SessionStart hook (which always returns 0 to avoid breaking
+# Claude Code) are still discoverable via `bloom-mcp doctor`.
+def _hook_error_log_path() -> Path:
+    return default_home() / "last_hook_error.log"
 
 
 # --- Prompts -----------------------------------------------------------------
@@ -176,15 +188,22 @@ def _maybe_collect_api_key(api_key_env: str, home: Path) -> None:
 
 def _step_register() -> None:
     print()
-    print("Step 4 — Claude Code integration")
-    if shutil.which("claude") and _prompt_yes_no(
+    print("Step 4 — Claude Code integration (optional)")
+    print("  You can also register Bloom later with:")
+    print("    claude mcp add bloom -- bloom-mcp serve")
+    if not shutil.which("claude"):
+        print("  Skipped: `claude` CLI not on PATH.")
+        return
+    # Default NO: on some Linux installs the bundled `claude` binary
+    # spits a Bun crash trace when invoked from a non-interactive shell,
+    # which scares users mid-wizard. Make registration explicit-opt-in.
+    if _prompt_yes_no(
         "  Register Bloom with Claude Code now?",
-        default=True,
+        default=False,
     ):
         _register_claude_code()
     else:
-        print("  Skipped. Run `bloom-mcp register` later, or add manually:")
-        print('    claude mcp add bloom -- bloom-mcp serve')
+        print("  Skipped. Run `bloom-mcp register` later if you want to.")
 
 
 def _step_install_hook() -> None:
@@ -256,7 +275,14 @@ def _write_env(path: Path, key: str, value: str) -> None:
 
 
 def _register_claude_code() -> bool:
+    """Run `claude mcp add bloom -- bloom-mcp serve`.
+
+    Wraps the subprocess so any failure — including the noisy Bun crash
+    trace some `claude` builds emit on Linux — is collapsed into a single
+    actionable line, never bubbled up to break the wizard.
+    """
     cmd = ["claude", "mcp", "add", "bloom", "--", "bloom-mcp", "serve"]
+    manual = "    claude mcp add bloom -- bloom-mcp serve"
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=10, check=False
@@ -268,12 +294,29 @@ def _register_claude_code() -> bool:
         )
         return False
     except subprocess.TimeoutExpired:
-        print("  X `claude mcp add` timed out after 10s.")
+        print("  ! `claude mcp add` timed out after 10s — register manually:")
+        print(manual)
+        return False
+    except OSError as e:
+        # Catch e.g. ENOEXEC / permission errors from broken claude binaries
+        # without exposing the full stack trace to the user.
+        print(f"  ! `claude mcp add` could not run ({e}) — register manually:")
+        print(manual)
         return False
     if result.returncode == 0:
         print("  OK Registered with Claude Code as `bloom`.")
         return True
-    print(f"  X `claude mcp add` failed: {result.stderr.strip() or result.stdout.strip()}")
+    # Non-zero exit. Take a short tail of stderr so a Bun crash dump
+    # doesn't paste 200 lines back at the user, but still leave a hint.
+    err = (result.stderr or result.stdout or "").strip()
+    if err:
+        first_line = err.splitlines()[0][:200]
+        print(f"  ! `claude mcp add` failed ({first_line}) — register manually:")
+    else:
+        print(
+            f"  ! `claude mcp add` exited {result.returncode} — register manually:"
+        )
+    print(manual)
     return False
 
 
@@ -453,13 +496,37 @@ def _format_recall_block(scored: list[Any], snippet_chars: int = 240) -> list[st
     return lines
 
 
+def _write_hook_error(exc: BaseException) -> None:
+    """Truncate-and-write a single-error log to ~/.bloom/last_hook_error.log.
+
+    The hook ALWAYS returns 0 to avoid breaking a Claude Code session, so
+    silent failures used to be invisible. We capture the most recent
+    failure to a small file (`bloom-mcp doctor` reads it) so the user can
+    actually find out why the warm-up block is empty.
+    """
+    try:
+        path = _hook_error_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+        head = f"{ts} {type(exc).__name__}: {exc}\n"
+        # Short traceback — last few frames only, no need to dump everything.
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        # Truncate to keep the file tiny; latest error fully wins, no append.
+        if len(tb) > 4000:
+            tb = tb[-4000:]
+        path.write_text(head + tb)
+    except Exception:  # noqa: BLE001 — logging must never raise.
+        pass
+
+
 def cmd_recall_print(args: argparse.Namespace) -> int:
     """Print recalled Bloom memories as plaintext — invoked by the SessionStart hook.
 
     We seed recall with `<cwd basename> <git branch>` so the warm-up block is
-    project-relevant, not just chronological. Failures are silent so a broken
-    Bloom never breaks a Claude Code session — set `BLOOM_DEBUG=1` to surface
-    the underlying exception while developing.
+    project-relevant, not just chronological. Failures ALWAYS write a one-line
+    trace to `~/.bloom/last_hook_error.log` so they're discoverable via
+    `bloom-mcp doctor`, but we still return 0 so a broken Bloom never breaks a
+    Claude Code session. Set `BLOOM_DEBUG=1` to surface the exception too.
     """
     try:
         cfg = Config.load()
@@ -492,7 +559,8 @@ def cmd_recall_print(args: argparse.Namespace) -> int:
         lines.append("==========================================")
         print("\n".join(lines))
         return 0
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _write_hook_error(e)
         if os.environ.get("BLOOM_DEBUG"):
             raise
         return 0
@@ -501,10 +569,19 @@ def cmd_recall_print(args: argparse.Namespace) -> int:
 # --- backfill-embeddings -----------------------------------------------------
 
 
+_CLOUD_PROVIDERS = {"openai", "anthropic"}
+
+
 def cmd_backfill_embeddings(args: argparse.Namespace) -> int:
     """Iterate rows where embedding IS NULL (and not soft-deleted), compute
     embeddings in batches of `args.batch`, write back via `db.update_embedding`.
     SIGINT stops cleanly and prints a summary of what was processed.
+
+    Bulk-sends every un-embedded turn's content to the configured embedder.
+    For cloud providers (openai / voyage), this is the ONE bulk-send op
+    Bloom performs — it's gated behind `--confirm` (or an interactive y/N
+    prompt when stdin is a TTY) so users never trigger a 1500-row upload
+    by accident.
     """
     try:
         cfg = Config.load()
@@ -537,6 +614,25 @@ def cmd_backfill_embeddings(args: argparse.Namespace) -> int:
     if total == 0:
         print("No rows need embedding — already fully backfilled.")
         return 0
+
+    is_cloud = cfg.embedder.provider in _CLOUD_PROVIDERS
+    if is_cloud and not args.confirm:
+        print(
+            f"This will send {total} turns to `{cfg.embedder.provider}` "
+            f"({embedder.name}) over HTTPS."
+        )
+        if sys.stdin.isatty():
+            ans = _prompt(f"  Proceed? send {total} turns to {cfg.embedder.provider}? [y/N]")
+            if ans.lower() not in ("y", "yes"):
+                print("Aborted. Re-run with `--confirm` to skip this prompt.")
+                return 0
+        else:
+            print(
+                "Refusing to bulk-send without `--confirm`. "
+                "Re-run as: bloom-mcp backfill-embeddings --confirm",
+                file=sys.stderr,
+            )
+            return 1
 
     print(f"Backfilling embeddings for {total} turns using {embedder.name}...")
 
@@ -585,6 +681,94 @@ def cmd_backfill_embeddings(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, prev_handler)
 
     print(f"Done. processed={processed} failed={failed} remaining={total - processed - failed}")
+    return 0
+
+
+# --- doctor ------------------------------------------------------------------
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Print install diagnostics + the last SessionStart hook error, if any.
+
+    Reads `~/.bloom/last_hook_error.log` (written by `cmd_recall_print`)
+    and dumps it verbatim. Useful when `recall-print` is failing silently
+    inside the SessionStart hook and the warm-up block looks empty.
+    """
+    print(f"bloom-mcp {__version__}")
+    print(f"  Python:       {sys.version.split()[0]}")
+    print(f"  Bloom home:   {default_home()}")
+    print(f"  Config path:  {default_config_path()}"
+          + ("  (present)" if default_config_path().exists() else "  (MISSING)"))
+    print(f"  .env path:    {default_env_path()}"
+          + ("  (present)" if default_env_path().exists() else "  (absent)"))
+
+    cfg: Config | None = None
+    try:
+        cfg = Config.load()
+    except ConfigError as e:
+        print(f"  Config load:  FAILED — {e}")
+    if cfg is not None:
+        print(f"  DB path:      {cfg.db_path}"
+              + ("  (present)" if cfg.db_path.exists() else "  (will be created)"))
+        print(f"  Embedder:     {cfg.embedder.provider}"
+              + (f" ({cfg.embedder.model})" if cfg.embedder.model else ""))
+        print(f"  retrieve_top_k: {cfg.retrieve_top_k}")
+
+        try:
+            from bloom.db import SCHEMA_VERSION, Database
+
+            db = Database(cfg.db_path)
+            s = db.stats()
+            print(f"  Schema:       v{s['schema_version']} (target v{SCHEMA_VERSION})")
+            print(f"  Turns:        {s['turns']}")
+            print(f"  Sessions:     {s['sessions']}")
+            print(f"  DB size:      {s['db_size_bytes']} bytes")
+        except Exception as e:  # noqa: BLE001
+            print(f"  DB stats:     FAILED — {e}")
+
+    log_path = _hook_error_log_path()
+    print()
+    if log_path.exists():
+        print(f"Last SessionStart hook error ({log_path}):")
+        try:
+            print(log_path.read_text())
+        except OSError as e:
+            print(f"  (could not read log: {e})")
+    else:
+        print("No SessionStart hook errors recorded.")
+    return 0
+
+
+# --- purge -------------------------------------------------------------------
+
+
+def cmd_purge(args: argparse.Namespace) -> int:
+    """Hard-delete soft-deleted rows. Requires `--hard` so it's never silent."""
+    if not args.hard:
+        print(
+            "purge: refusing to run without `--hard`. "
+            "Use `bloom-mcp purge --hard` to permanently remove soft-deleted rows.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        cfg = Config.load()
+    except ConfigError as e:
+        print(f"bloom-mcp: configuration error: {e}", file=sys.stderr)
+        return 2
+
+    from bloom.db import Database
+
+    db = Database(cfg.db_path)
+    with db.connect() as con:
+        before = con.execute(
+            "SELECT COUNT(*) AS c FROM turns WHERE deleted_at IS NOT NULL"
+        ).fetchone()["c"]
+        if before == 0:
+            print("Nothing to purge — no soft-deleted rows.")
+            return 0
+        con.execute("DELETE FROM turns WHERE deleted_at IS NOT NULL")
+    print(f"Purged {before} soft-deleted turn(s).")
     return 0
 
 
@@ -641,7 +825,32 @@ def main(argv: list[str] | None = None) -> int:
         default=100,
         help="Batch size for embedder API calls (default: 100).",
     )
+    p_back.add_argument(
+        "--confirm",
+        action="store_true",
+        help=(
+            "Required for cloud embedders (openai/anthropic) — acknowledges "
+            "that every un-embedded turn's content will be sent over HTTPS."
+        ),
+    )
     p_back.set_defaults(func=cmd_backfill_embeddings)
+
+    p_doc = sub.add_parser(
+        "doctor",
+        help="Print diagnostics + the last SessionStart hook error (if any).",
+    )
+    p_doc.set_defaults(func=cmd_doctor)
+
+    p_purge = sub.add_parser(
+        "purge",
+        help="Hard-delete soft-deleted turns. Requires --hard.",
+    )
+    p_purge.add_argument(
+        "--hard",
+        action="store_true",
+        help="Required confirmation flag — soft-deleted rows are gone for good.",
+    )
+    p_purge.set_defaults(func=cmd_purge)
 
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
